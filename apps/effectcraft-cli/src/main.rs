@@ -438,7 +438,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     }
     template::validate(cmd, args)?;
     match cmd {
-        "render" => render(args, json_out)?,
+        "render" => render_reporting(args, json_out)?,
         "bench" => bench_cmd(args)?,
         "info" => {
             let mut b = backend(args, true)?;
@@ -650,9 +650,50 @@ fn from_cwd(path: &str) -> Result<String, Failure> {
     std::path::absolute(path).map(|p| p.to_string_lossy().into_owned()).map_err(|e| Failure::Error(format!("render: cannot resolve --out {path}: {e}")))
 }
 
+/// `EFFECTCRAFT_PROGRESS=jsonl`: stderr carries JSON lines for a supervising process instead of
+/// the terminal progress line.
+fn progress_jsonl() -> bool {
+    std::env::var("EFFECTCRAFT_PROGRESS").is_ok_and(|v| v == "jsonl")
+}
+
+/// [`render`], ending with `{"done":true,"out":…,"ms":…}` or `{"error":…}` under
+/// [`progress_jsonl`].
+fn render_reporting(args: &Args, json_out: bool) -> Result<(), Failure> {
+    let t0 = std::time::Instant::now();
+    let r = render(args, json_out);
+    if !progress_jsonl() {
+        return r.map(|_| ());
+    }
+    match r {
+        Ok(outputs) => {
+            note!("{}", json!({"done": true, "out": outputs.last(), "ms": t0.elapsed().as_millis() as u64}));
+            Ok(())
+        }
+        // The error line stays the last line on stderr (no usage text or message after it).
+        Err(f) => {
+            let (e, code) = match f {
+                Failure::Usage(e) => (e, 2),
+                Failure::Error(e) => (e, 1),
+            };
+            if json_out {
+                say!("{}", json!({"error": e}));
+            }
+            note!("{}", json!({"error": e}));
+            std::process::exit(code);
+        }
+    }
+}
+
+/// Overall progress of a render job (0..1): finished items plus the current item's frames.
+fn job_progress(p: &effectcraft_engine::render_queue::JobState) -> f64 {
+    let item = if p.total == 0 { 0.0 } else { p.done as f64 / p.total as f64 };
+    ((p.items_done as f64 + item.min(1.0)) / p.items_total.max(1) as f64).clamp(0.0, 1.0)
+}
+
 /// `render`: queue `--comp` (or the active comp) with the given settings unless `--queue`, then
-/// render the queue with a progress line on stderr. Fails if any item fails.
-fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
+/// render the queue with a progress line on stderr. Fails if any item fails. Returns the
+/// rendered outputs.
+fn render(args: &Args, json_out: bool) -> Result<Vec<String>, Failure> {
     use effectcraft_engine::project::render_queue::{OutputFormat, RenderStatus};
     if args.opt("--bridge").is_some() {
         return usage_err("render runs headless; use `exec renderQueue.add` / `renderQueue.render` with --bridge");
@@ -730,20 +771,31 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
             let _ = s.execute("renderQueue.setRender", json!({"index": k + 1, "render": false}));
         }
         let r = s.execute("renderQueue.add", p).map_err(err)?;
-        note!(
-            "{} → {} ({}×{}, {} frames, {})",
-            r["compName"].as_str().unwrap_or("?"),
-            r["outputPath"].as_str().unwrap_or("?"),
-            r["width"],
-            r["height"],
-            r["frames"],
-            r["outputModuleSummary"].as_str().unwrap_or("")
-        );
+        if !progress_jsonl() {
+            note!(
+                "{} → {} ({}×{}, {} frames, {})",
+                r["compName"].as_str().unwrap_or("?"),
+                r["outputPath"].as_str().unwrap_or("?"),
+                r["width"],
+                r["height"],
+                r["frames"],
+                r["outputModuleSummary"].as_str().unwrap_or("")
+            );
+        }
     }
     s.execute("renderQueue.render", json!({"wait": false})).map_err(err)?;
-    let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let jsonl = progress_jsonl();
+    let tty = !jsonl && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let mut reported: Option<(std::time::Instant, (u64, u64, usize))> = None;
     while s.is_rendering() {
         std::thread::sleep(std::time::Duration::from_millis(100));
+        if jsonl && let Some(p) = s.render_progress() {
+            let at = (p.done, p.total, p.items_done);
+            if reported.is_none_or(|(t, last)| last != at && t.elapsed() >= std::time::Duration::from_millis(100)) {
+                note!("{}", json!({"progress": job_progress(&p), "frame": p.done, "frames": p.total}));
+                reported = Some((std::time::Instant::now(), at));
+            }
+        }
         if tty && let Some(p) = s.render_progress() {
             let left = p.remaining.map(|r| format!(", ~{r:.1}s left")).unwrap_or_default();
             let _ = write!(
@@ -769,7 +821,9 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         let name = s.project.item(it.comp).map(|i| i.name.clone()).unwrap_or_else(|| "?".into());
         match &it.status {
             RenderStatus::Done => {
-                note!("done: {name} → {} in {:.2}s", it.last_output.as_deref().unwrap_or("?"), it.render_time.unwrap_or(0.0));
+                if !jsonl {
+                    note!("done: {name} → {} in {:.2}s", it.last_output.as_deref().unwrap_or("?"), it.render_time.unwrap_or(0.0));
+                }
                 results.push(json!({"comp": name, "output": it.last_output, "seconds": it.render_time}));
             }
             RenderStatus::Failed(e) => failed.push(format!("{name}: {e}")),
@@ -782,7 +836,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
     if json_out {
         emit(&json!({"rendered": results}), true);
     }
-    Ok(())
+    Ok(results.iter().filter_map(|r| r["output"].as_str().map(str::to_string)).collect())
 }
 
 /// `commands` / `exec --list`: every engine command (id, label, shortcut, params doc; with

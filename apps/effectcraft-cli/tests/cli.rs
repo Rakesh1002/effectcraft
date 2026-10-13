@@ -491,3 +491,30 @@ fn render_bitrate_applies_to_vp9_webm() {
     assert!(high > low, "100 kbps: {low} bytes, 8000 kbps: {high} bytes");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `EFFECTCRAFT_PROGRESS=jsonl`: stderr is JSON lines, progress then one final line.
+#[test]
+fn render_progress_jsonl() {
+    let out = tmp("jsonl.gif");
+    let o = bin()
+        .env("EFFECTCRAFT_PROGRESS", "jsonl")
+        .args(["render", "--start", "0", "--end", "1", "--resolution", "quarter", "--out", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let lines: Vec<Value> = String::from_utf8_lossy(&o.stderr).lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let last = lines.last().unwrap();
+    assert_eq!(last["done"], true, "{lines:?}");
+    assert_eq!(PathBuf::from(last["out"].as_str().unwrap()), out);
+    assert!(last["ms"].as_u64().is_some());
+    for p in &lines[..lines.len() - 1] {
+        let f = p["progress"].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&f), "{p}");
+        assert!(p["frame"].as_u64().unwrap() <= p["frames"].as_u64().unwrap());
+    }
+
+    let o = bin().env("EFFECTCRAFT_PROGRESS", "jsonl").args(["render", "--project", "/nonexistent/x.ecproj", "--out", out.to_str().unwrap()]).output().unwrap();
+    assert!(!o.status.success());
+    let last: Value = serde_json::from_str(String::from_utf8_lossy(&o.stderr).lines().last().unwrap()).unwrap();
+    assert!(last["error"].as_str().is_some_and(|e| !e.is_empty()), "{last}");
+}
