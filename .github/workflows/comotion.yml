@@ -1,0 +1,123 @@
+name: comotion
+
+on:
+  push:
+    tags: ["comotion-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: comotion-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  WASM_BINDGEN_VERSION: "0.2.129"
+  BINARYEN_VERSION: "version_133"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Rust version
+        id: rust
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: comotion-${{ steps.rust.outputs.version }}
+
+      - name: Cache wasm-bindgen CLI
+        id: bindgen-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-${{ env.WASM_BINDGEN_VERSION }}-${{ steps.rust.outputs.version }}
+
+      - name: Install wasm-bindgen CLI
+        if: steps.bindgen-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+
+      - name: Install binaryen and brotli
+        run: |
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/$BINARYEN_VERSION/binaryen-$BINARYEN_VERSION-x86_64-linux.tar.gz" -o binaryen.tar.gz
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/$BINARYEN_VERSION/binaryen-$BINARYEN_VERSION-x86_64-linux.tar.gz.sha256" -o binaryen.tar.gz.sha256
+          echo "$(cut -d' ' -f1 binaryen.tar.gz.sha256)  binaryen.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/binaryen"
+          tar -xzf binaryen.tar.gz -C "$RUNNER_TEMP/binaryen" --strip-components=1
+          rm binaryen.tar.gz binaryen.tar.gz.sha256
+          echo "$RUNNER_TEMP/binaryen/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends brotli
+          "$RUNNER_TEMP/binaryen/bin/wasm-opt" --version
+
+      - name: Build web and CLI
+        run: |
+          echo "BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
+          cargo xtask web
+          cargo build --release -p effectcraft-cli
+          echo "BUILD_END=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          DIST=target/web/dist
+          OUT=release
+          mkdir -p "$OUT"
+          find "$DIST" -type f \( -name '*.wasm' -o -name '*.js' \) | while read -r f; do
+            brotli -q 11 -k -f "$f"
+            gzip -9 -k -f "$f"
+          done
+          {
+            for f in LICENSE-MIT NOTICE ATTRIBUTION.md assets/app-icon/LICENSE.txt assets/fonts/OFL-*.txt; do
+              printf '==> %s <==\n\n' "$f"
+              cat "$f"
+              printf '\n\n'
+            done
+          } > "$DIST/LICENSES.txt"
+          tar -czf "$OUT/comotion-web-dist.tar.gz" -C "$DIST" .
+          CLI_DIR="$RUNNER_TEMP/effectcraft-cli"
+          mkdir -p "$CLI_DIR"
+          cp target/release/effectcraft-cli "$CLI_DIR/"
+          cp "$DIST/LICENSES.txt" "$CLI_DIR/"
+          tar -czf "$OUT/effectcraft-cli-linux-x86_64.tar.gz" -C "$CLI_DIR" .
+          git fetch --no-tags https://github.com/storytold/effectcraft.git main
+          UPSTREAM_BASE="$(git merge-base HEAD FETCH_HEAD)"
+          WASM_BYTES="$(stat -c %s "$DIST/effectcraft_web_bg.wasm")"
+          WASM_BR_BYTES="$(stat -c %s "$DIST/effectcraft_web_bg.wasm.br")"
+          jq -n --arg sha "$GITHUB_SHA" --arg base "$UPSTREAM_BASE" \
+            --argjson wasm "$WASM_BYTES" --argjson br "$WASM_BR_BYTES" \
+            --argjson secs "$((BUILD_END - BUILD_START))" \
+            '{sha: $sha, upstreamBase: $base, wasmBytes: $wasm, wasmBrBytes: $br, buildSeconds: $secs}' > "$OUT/build.json"
+          (cd "$OUT" && sha256sum comotion-web-dist.tar.gz effectcraft-cli-linux-x86_64.tar.gz build.json > SHA256SUMS.txt)
+          cat "$OUT/build.json"
+          ls -l "$OUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: comotion-release
+          path: release/*
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/comotion-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "comotion engine build of $GITHUB_SHA (upstream base in build.json)." \
+            --target "$GITHUB_SHA"
