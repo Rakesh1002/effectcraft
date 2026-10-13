@@ -53,6 +53,17 @@ pub(crate) fn with_app<R>(f: impl FnOnce(&mut EffectcraftApp) -> R) -> Option<R>
     Some(f(&mut web.app))
 }
 
+/// Serve control requests without a frame (`?embed` in a hidden page) and report a revision
+/// change. Whether the app was reachable.
+pub(crate) fn pump_control() -> bool {
+    let Some(ctx) = CTX.with(|c| c.borrow().clone()) else { return false };
+    with_app(|app| {
+        app.pump_control(&ctx);
+        embed::tick(&app.session);
+    })
+    .is_some()
+}
+
 /// Hand a file's bytes to the media pool (footage of a project opened later).
 pub(crate) fn register_media(path: &str, data: Arc<[u8]>) {
     POOL.with(|p| {
@@ -274,6 +285,9 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     storage::refresh();
     let runner = eframe::WebRunner::new();
     RUNNER.with(|r| *r.borrow_mut() = Some(runner.clone()));
+    if embedded {
+        api::pump_on_hide(&doc);
+    }
     runner
         .start(
             canvas,

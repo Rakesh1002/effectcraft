@@ -6,7 +6,8 @@
 // Memory storage and an empty start; putFile stores without importing; exportProject returns
 // the File > Save text and the revision; markSaved only marks the revision it was given;
 // `effectcraft:revision`, `effectcraft:save-request`, `effectcraft:output` and
-// `effectcraft:import-request` fire, and nothing downloads. Prints a JSON report; exits non-zero
+// `effectcraft:import-request` fire, and nothing downloads. With the tab hidden (another tab in
+// front: no animation frames) `execute` and `renderFrame` still resolve. Prints a JSON report; exits non-zero
 // on failure.
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
@@ -29,6 +30,7 @@ const proc = spawn(chrome, [
   `--user-data-dir=${join(out, "profile")}`,
   "--no-first-run",
   "--no-default-browser-check",
+  "--disable-component-update",
   "--enable-unsafe-webgpu",
   "--window-size=1400,900",
   "about:blank",
@@ -36,15 +38,18 @@ const proc = spawn(chrome, [
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let ws;
+let pageId;
 let nextId = 1;
 const waiting = new Map();
 const chooser = [];
+const started = [];
 
 async function connect() {
   for (let i = 0; i < 100; i++) {
     try {
       const page = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find((t) => t.type === "page");
       if (page) {
+        pageId = page.id;
         ws = new WebSocket(page.webSocketDebuggerUrl);
         await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
         ws.onmessage = (m) => {
@@ -52,6 +57,8 @@ async function connect() {
           if (msg.id && waiting.has(msg.id)) {
             waiting.get(msg.id)(msg);
             waiting.delete(msg.id);
+          } else if (msg.method === "Browser.downloadWillBegin") {
+            started.push(msg.params.url);
           } else if (msg.method === "Page.fileChooserOpened") {
             chooser.push(msg.params);
           }
@@ -96,7 +103,7 @@ let failed = false;
 try {
   await connect();
   await send("Page.enable");
-  await send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: downloads });
+  await send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: downloads, eventsEnabled: true });
   await send("Page.addScriptToEvaluateOnNewDocument", {
     source: `window.__ec = [];
       for (const name of ["effectcraft:revision", "effectcraft:save-request", "effectcraft:output", "effectcraft:import-request"]) {
@@ -182,10 +189,36 @@ try {
     report.steps.importRequest = "skipped: the headless file chooser did not open without a user gesture";
   }
 
+  const other = await send("Target.createTarget", { url: "about:blank" });
+  await send("Target.activateTarget", { targetId: other.targetId });
+  await until("document.hidden", 10000).catch(() => {});
+  const hidden = await js("document.hidden");
+  if (hidden) {
+    const timed = async (expr) => {
+      const t0 = Date.now();
+      const v = await js(`Promise.race([${expr}, new Promise((_, rej) => setTimeout(() => rej(new Error("no reply in 10 s")), 10000))])`);
+      return [Date.now() - t0, v];
+    };
+    const rafWhileHidden = await js(`new Promise((res) => { let n = 0; const f = () => { n++; requestAnimationFrame(f); }; requestAnimationFrame(f); setTimeout(() => res(n), 1000); })`);
+    const [executeMs] = await timed(`effectcraft.execute("comp.new", {name: "Hidden", width: 32, height: 32, duration: 0.1})`);
+    const [renderFrameMs, frame] = await timed(`effectcraft.renderFrame({max_side: 64}).then((r) => JSON.stringify(r).length)`);
+    const [revisionMs, rev] = await timed(`new Promise((res) => { const r = effectcraft.revision(); const t = setInterval(() => { const e = window.__ec.filter((x) => x.name === "effectcraft:revision").pop(); if (e && e.detail.revision === r) { clearInterval(t); res(r); } }, 20); })`);
+    report.steps.hiddenTab = { hidden, rafWhileHidden, executeMs, renderFrameMs, frameJsonBytes: frame, revisionEventMs: revisionMs, revision: rev };
+    check(frame > 0, "renderFrame in a hidden tab");
+  } else {
+    report.steps.hiddenTab = "skipped: this Chrome did not hide the page behind another tab";
+  }
+  await send("Target.activateTarget", { targetId: pageId });
+  await until("!document.hidden", 10000);
+  const t0 = Date.now();
+  await js(`effectcraft.execute("comp.new", {name: "Visible", width: 32, height: 32, duration: 0.1})`);
+  report.steps.visibleAgain = { executeMs: Date.now() - t0 };
+
   await sleep(1000);
-  const dl = readdirSync(downloads);
-  check(dl.length === 0, `downloads: ${dl}`);
-  report.steps.downloads = dl.length;
+  const origin = new URL(base).origin;
+  const ours = started.filter((u) => u.startsWith("blob:") || u.startsWith(origin));
+  check(ours.length === 0, `downloads: ${ours}`);
+  report.steps.downloads = { fromThePage: ours.length, files: readdirSync(downloads).length };
 } catch (e) {
   failed = true;
   report.error = String(e && e.stack || e);

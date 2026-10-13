@@ -12,6 +12,10 @@
 //!
 //! Events are dispatched on `window` from a microtask, after the frame, so a listener can call
 //! back into `window.effectcraft` right away.
+//!
+//! A hidden page gets no animation frames, so the control channel (`execute`, `request`,
+//! `renderFrame`) would wait for the tab to show again; while hidden, requests are served between
+//! frames instead ([`ControlPump`]).
 
 /// A project file the host saves (`.ecproj`, or its XML form).
 pub fn is_project_path(path: &str) -> bool {
@@ -33,6 +37,47 @@ impl RevisionWatch {
         }
         self.last = Some(now);
         Some(now)
+    }
+}
+
+/// When to serve control requests between frames: from a microtask right after a request
+/// arrives in a hidden page (timers there are throttled to about one a second), then on a timer
+/// while replies are still pending (a job running in a worker). At most one of each is queued; a
+/// visible page leaves it to the frames.
+#[derive(Default)]
+pub struct ControlPump {
+    queued: bool,
+    timer: bool,
+}
+
+impl ControlPump {
+    /// A request arrived or the page was hidden: whether to queue a pump now.
+    pub fn wake(&mut self, embedded: bool, hidden: bool) -> bool {
+        if !embedded || !hidden || self.queued {
+            return false;
+        }
+        self.queued = true;
+        true
+    }
+
+    /// A queued (`timer`: false) or timed pump runs: whether to serve the channel (the page may
+    /// have shown again).
+    pub fn run(&mut self, timer: bool, hidden: bool) -> bool {
+        if timer {
+            self.timer = false;
+        } else {
+            self.queued = false;
+        }
+        hidden
+    }
+
+    /// After serving: whether to set a timer to pump again.
+    pub fn again(&mut self, hidden: bool, pending: usize) -> bool {
+        if !hidden || pending == 0 || self.timer {
+            return false;
+        }
+        self.timer = true;
+        true
     }
 }
 
@@ -126,6 +171,25 @@ mod tests {
         assert!(is_project_path("/a/B.ECPROJX"));
         assert!(!is_project_path("/Frame.png"));
         assert!(!is_project_path("/notes.ecproj.txt"));
+    }
+
+    #[test]
+    fn the_pump_serves_hidden_embedded_pages_only() {
+        let mut p = ControlPump::default();
+        assert!(!p.wake(false, true));
+        assert!(!p.wake(true, false));
+        assert!(p.wake(true, true));
+        assert!(!p.wake(true, true), "one queued pump at a time");
+        assert!(p.run(false, true));
+        assert!(p.again(true, 1), "replies still pending");
+        assert!(!p.again(true, 1), "one timer at a time");
+        assert!(p.wake(true, true), "a new request does not wait for the timer");
+        assert!(p.run(false, true));
+        assert!(!p.run(true, false), "the page showed again: frames serve");
+        assert!(!p.again(false, 1));
+        assert!(p.wake(true, true));
+        assert!(p.run(false, true));
+        assert!(!p.again(true, 0), "nothing pending");
     }
 
     #[test]

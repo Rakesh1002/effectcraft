@@ -16,6 +16,44 @@ thread_local! {
     static TX: RefCell<Option<Sender<ControlRequest>>> = const { RefCell::new(None) };
     static PENDING: RefCell<Vec<Pending>> = const { RefCell::new(Vec::new()) };
     static INFO: RefCell<Value> = const { RefCell::new(Value::Null) };
+    static PUMP: RefCell<crate::embed::ControlPump> = RefCell::new(crate::embed::ControlPump::default());
+}
+
+const PUMP_RETRY_MS: i32 = 50;
+
+fn page_hidden() -> bool {
+    web_sys::window().and_then(|w| w.document()).is_some_and(|d| d.hidden())
+}
+
+/// `?embed` in a hidden page: serve the control channel from a microtask, since no frame will.
+fn wake_pump() {
+    if PUMP.with(|p| p.borrow_mut().wake(crate::embed::active(), page_hidden())) {
+        wasm_bindgen_futures::spawn_local(async { pump(false) });
+    }
+}
+
+fn pump(timer: bool) {
+    let hidden = page_hidden();
+    if !PUMP.with(|p| p.borrow_mut().run(timer, hidden)) {
+        return;
+    }
+    let served = crate::pump_control();
+    poll_replies();
+    let pending = if served { PENDING.with(|p| p.borrow().len()) } else { 1 };
+    if PUMP.with(|p| p.borrow_mut().again(hidden, pending)) {
+        let later = Closure::once_into_js(|| pump(true));
+        let set = web_sys::window().map(|w| w.set_timeout_with_callback_and_timeout_and_arguments_0(later.unchecked_ref(), PUMP_RETRY_MS));
+        if !matches!(set, Some(Ok(_))) {
+            PUMP.with(|p| p.borrow_mut().run(true, false));
+        }
+    }
+}
+
+/// Requests sent just before the page was hidden are served too.
+pub(crate) fn pump_on_hide(doc: &web_sys::Document) {
+    let on_change = Closure::<dyn FnMut()>::new(wake_pump);
+    let _ = doc.add_event_listener_with_callback("visibilitychange", on_change.as_ref().unchecked_ref());
+    on_change.forget();
 }
 
 pub(crate) fn set_sender(tx: Sender<ControlRequest>) {
@@ -58,6 +96,7 @@ pub fn request(method: String, params: JsValue) -> js_sys::Promise {
         }
         PENDING.with(|p| p.borrow_mut().push((rx, resolve, reject)));
         crate::repaint();
+        wake_pump();
     })
 }
 

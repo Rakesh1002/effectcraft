@@ -1459,6 +1459,12 @@ impl EffectcraftApp {
         ctx.request_repaint();
     }
 
+    /// Serve the control channel between frames, for a host whose frames are paused (a hidden
+    /// browser tab gets no animation frames).
+    pub fn pump_control(&mut self, ctx: &egui::Context) {
+        self.drain_control(ctx);
+    }
+
     fn drain_control(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.control_rx.take() else { return };
         let now = ctx.input(|i| i.time);
