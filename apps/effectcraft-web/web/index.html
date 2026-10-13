@@ -79,11 +79,17 @@
       listStored: () => ec.listStored(),
       removeStored: (path) => ec.removeStored(path),
       flush: () => ec.flush(),
+      // Host pages (?embed): file table writes, the project as File ▸ Save writes it, and the saved mark.
+      putFile: (path, bytes) => ec.putFile(path, bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)),
+      exportProject: () => ec.exportProject(),
+      markSaved: (revision) => ec.markSaved(revision),
+      revision: () => ec.revision(),
       // A frame rendered in a frame worker (its GPU by default) vs the page's CPU: {maxDiff, meanDiff, over4, …}.
       workerFrameCheck: (params) => ec.workerFrameCheck(params ?? {}).then(JSON.parse),
     };
     // Offline start and install (PWA): the service worker caches the app's files.
-    if ("serviceWorker" in navigator && !new URLSearchParams(location.search).has("nosw")) {
+    const query = new URLSearchParams(location.search);
+    if ("serviceWorker" in navigator && !query.has("nosw") && !query.has("embed")) {
       navigator.serviceWorker.register("sw.js").catch((e) => console.warn("service worker:", e));
     }
     try {

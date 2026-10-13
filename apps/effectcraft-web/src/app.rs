@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use effectcraft_engine::Session;
 
-use crate::{api, audio, browse, diskcache, files, frames, persist, storage, worker};
+use crate::{api, audio, browse, diskcache, embed, files, frames, persist, storage, worker};
 use effectcraft_ui_egui::EffectcraftApp;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
@@ -41,6 +41,25 @@ pub fn page_url(rel: &str) -> String {
 thread_local! {
     static ACTIONS: RefCell<Vec<Action>> = const { RefCell::new(Vec::new()) };
     static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
+    static RUNNER: RefCell<Option<eframe::WebRunner>> = const { RefCell::new(None) };
+    static POOL: RefCell<Option<Arc<effectcraft_media::MediaPool>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` on the app now, between frames (it keeps running while the page is hidden, when
+/// [`post`] waits for the next frame). `None` while a frame runs or before the app starts.
+pub(crate) fn with_app<R>(f: impl FnOnce(&mut EffectcraftApp) -> R) -> Option<R> {
+    let runner = RUNNER.with(|r| r.borrow().clone())?;
+    let mut web = runner.app_mut::<WebApp>()?;
+    Some(f(&mut web.app))
+}
+
+/// Hand a file's bytes to the media pool (footage of a project opened later).
+pub(crate) fn register_media(path: &str, data: Arc<[u8]>) {
+    POOL.with(|p| {
+        if let Some(pool) = p.borrow().as_ref() {
+            pool.add_bytes(path, data);
+        }
+    });
 }
 
 /// Run `f` on the UI thread at the next frame.
@@ -97,7 +116,10 @@ impl eframe::App for WebApp {
         }
         // Files dropped on the page: read them, then open/import.
         let dropped: Vec<web_sys::File> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.web_file().cloned()).collect());
-        if !dropped.is_empty() {
+        if embed::active() {
+            embed::import_request("drop", dropped);
+            self.app.session.prefs.auto_save.enabled = false;
+        } else if !dropped.is_empty() {
             files::read_files(dropped, |paths| post(move |app| open_or_import(app, paths)));
         }
         self.app.logic(ctx, frame);
@@ -112,8 +134,15 @@ impl eframe::App for WebApp {
         api::set_info("frameWorkers", frames::stats());
         // Settings ▸ Disk ▸ Disk Cache (frames in the Origin Private File System).
         let d = &self.app.session.prefs.disk;
-        diskcache::configure(d.disk_cache_enabled, d.disk_cache_max_gb, storage::quota());
+        diskcache::configure(d.disk_cache_enabled && !embed::active(), d.disk_cache_max_gb, storage::quota());
         api::set_info("diskCache", diskcache::stats());
+        if embed::active() {
+            embed::tick(&self.app.session);
+        }
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut *self)
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -138,6 +167,7 @@ fn query_value(name: &str) -> Option<String> {
 pub fn session() -> Session {
     let pool = Arc::new(effectcraft_media::MediaPool::new());
     persist::register_media(&pool);
+    POOL.with(|p| *p.borrow_mut() = Some(pool.clone()));
     Session {
         services: Arc::new(files::WebServices),
         footage: pool.clone(),
@@ -160,6 +190,10 @@ pub fn session() -> Session {
 
 /// Browser file pickers in place of the desktop's file dialogs.
 fn install_hooks(app: &mut EffectcraftApp) {
+    if embed::active() {
+        install_embed_hooks(app);
+        return;
+    }
     app.hooks.pick_files = Some(Box::new(|exts: &[&str]| {
         let accept = exts.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join(",");
         if let Err(e) = files::pick(&accept, true, |paths| post(move |app| open_or_import(app, paths))) {
@@ -180,18 +214,51 @@ fn install_hooks(app: &mut EffectcraftApp) {
     app.hooks.audio_devices = Some(Box::new(|| vec!["Browser default output".into()]));
 }
 
+/// `?embed`: the pickers hand the browser files to the host page, and saving a project asks the
+/// host to save it.
+fn install_embed_hooks(app: &mut EffectcraftApp) {
+    app.hooks.pick_files = Some(Box::new(|exts: &[&str]| {
+        let accept = exts.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join(",");
+        if let Err(e) = files::pick_raw(&accept, true, |picked| embed::import_request("import", picked)) {
+            log::warn!("file picker: {e:?}");
+        }
+        Vec::new()
+    }));
+    app.hooks.pick_open_project = Some(Box::new(|| {
+        if let Err(e) = files::pick_raw(".ecproj", false, |picked| embed::import_request("open", picked)) {
+            log::warn!("file picker: {e:?}");
+        }
+        None
+    }));
+    app.hooks.pick_save = Some(Box::new(|name: &str| {
+        let name = if name.is_empty() { "Untitled Project.ecproj" } else { name };
+        if embed::is_project_path(name) {
+            embed::save_request(None);
+            return None;
+        }
+        Some(files::path_for(name))
+    }));
+    app.hooks.audio_device = Some(Box::new(audio::open));
+    app.hooks.audio_devices = Some(Box::new(|| vec!["Browser default output".into()]));
+}
+
 /// Entry point (called by the page's bootstrap script once the wasm module is instantiated).
 #[wasm_bindgen]
 pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
     let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
     let canvas: web_sys::HtmlCanvasElement = doc.get_element_by_id(&canvas_id).ok_or("no canvas")?.dyn_into()?;
-    let empty = query_flag("empty");
+    let embedded = query_flag("embed");
+    if embedded {
+        embed::set_active();
+    }
+    let empty = embedded || query_flag("empty");
     let home = query_flag("home");
     // Browser storage: settings, recent projects, imported media, saved projects, auto-saves and
     // the last session come back.
     let t0 = js_sys::Date::now();
-    let stored = match persist::load(&query_value("storage").unwrap_or_default()).await {
+    let prefer = if embedded { "memory".to_string() } else { query_value("storage").unwrap_or_default() };
+    let stored = match persist::load(&prefer).await {
         Ok(n) => n,
         Err(e) => {
             log::warn!("browser storage unavailable: {e}");
@@ -200,10 +267,13 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     };
     api::set_info("storage", json!({"backend": persist::backend(), "entries": stored, "loadMs": js_sys::Date::now() - t0}));
     audio::install_unlock();
-    browse::restore();
-    diskcache::init();
+    if !embedded {
+        browse::restore();
+        diskcache::init();
+    }
     storage::refresh();
     let runner = eframe::WebRunner::new();
+    RUNNER.with(|r| *r.borrow_mut() = Some(runner.clone()));
     runner
         .start(
             canvas,
@@ -233,6 +303,10 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                 }
                 let mut session = session();
                 session.load_settings();
+                if embedded {
+                    session.prefs.auto_save.enabled = false;
+                    session.prefs.disk.disk_cache_enabled = false;
+                }
                 let recovery = session.begin_recovery();
                 // `?empty`: a blank project; `?demo`: the demo project; otherwise the last visit's
                 // project (the demo on a first visit).

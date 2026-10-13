@@ -128,6 +128,14 @@ impl Services for WebServices {
         if quiet || crate::is_worker() {
             return Ok(());
         }
+        if crate::embed::active() {
+            if crate::embed::is_project_path(path) {
+                crate::embed::save_request(Some(path));
+            } else {
+                crate::embed::output(vec![path.to_string()]);
+            }
+            return Ok(());
+        }
         download(file_name(path), data).map_err(|e| std::io::Error::other(format!("download failed: {e:?}")))
     }
     fn store_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
@@ -181,6 +189,13 @@ pub fn export_sink() -> Arc<effectcraft_export::Sink> {
 /// Download the render outputs written since the last call.
 pub fn flush_downloads() {
     let paths = std::mem::take(&mut *OUTPUTS.lock().unwrap_or_else(|e| e.into_inner()));
+    if crate::embed::active() {
+        let mut paths = paths;
+        paths.sort();
+        paths.dedup();
+        crate::embed::output(paths);
+        return;
+    }
     let mut out: Vec<(String, Arc<[u8]>)> = paths.into_iter().filter_map(|p| get(&p).map(|d| (file_name(&p).to_string(), d))).collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out.dedup_by(|a, b| a.0 == b.0);
@@ -255,6 +270,11 @@ pub fn zip_store(entries: &[(String, Arc<[u8]>)]) -> Vec<u8> {
 
 /// Show the browser's file picker; `then` gets the picked files' table paths once they are read.
 pub fn pick(accept: &str, multiple: bool, then: impl FnOnce(Vec<String>) + 'static) -> Result<(), JsValue> {
+    pick_raw(accept, multiple, move |files| read_files(files, then))
+}
+
+/// Show the browser's file picker; `then` gets the picked browser files, unread.
+pub fn pick_raw(accept: &str, multiple: bool, then: impl FnOnce(Vec<web_sys::File>) + 'static) -> Result<(), JsValue> {
     let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
     let input: web_sys::HtmlInputElement = doc.create_element("input")?.dyn_into()?;
     input.set_type("file");
@@ -263,7 +283,7 @@ pub fn pick(accept: &str, multiple: bool, then: impl FnOnce(Vec<String>) + 'stat
     let inp = input.clone();
     let on_change = Closure::once_into_js(move || {
         let Some(list) = inp.files() else { return };
-        read_files((0..list.length()).filter_map(|i| list.get(i)).collect(), then);
+        then((0..list.length()).filter_map(|i| list.get(i)).collect());
     });
     input.add_event_listener_with_callback("change", on_change.unchecked_ref())?;
     input.click();

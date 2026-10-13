@@ -3,9 +3,10 @@
 //! `effectcraft.request(method, params)`, `effectcraft.execute(command, params)` and friends.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
-use effectcraft_ui_egui::ControlRequest;
+use effectcraft_ui_egui::{ControlRequest, EffectcraftApp};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 
@@ -81,6 +82,80 @@ pub fn add_file(name: String, data: js_sys::Uint8Array) -> String {
     let p = path.clone();
     crate::post(move |app| crate::open_or_import(app, vec![p]));
     path
+}
+
+/// Store bytes in the file table under `path` (`/assets/<id>/<name>`) without opening or
+/// importing them: a later `file.import` or `file.open` reads them from there. Returns the table
+/// path.
+#[wasm_bindgen(js_name = putFile)]
+pub fn put_file(path: String, data: js_sys::Uint8Array) -> Result<String, JsValue> {
+    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    if path.ends_with('/') {
+        return Err(JsValue::from_str("putFile: the path names a folder"));
+    }
+    let bytes: Arc<[u8]> = data.to_vec().into();
+    crate::files::put(&path, bytes.clone());
+    if !crate::embed::is_project_path(&path) {
+        crate::register_media(&path, bytes);
+    }
+    Ok(path)
+}
+
+/// Settle a promise with `f` run on the app: right away between frames, else at the next frame.
+fn on_app(f: impl FnOnce(&mut EffectcraftApp) -> Result<Value, String> + 'static) -> js_sys::Promise {
+    let mut f = Some(f);
+    js_sys::Promise::new(&mut |resolve, reject| {
+        let settle = move |r: Result<Value, String>| match r {
+            Ok(v) => {
+                let _ = resolve.call1(&JsValue::NULL, &to_js(&v));
+            }
+            Err(e) => {
+                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&e));
+            }
+        };
+        let Some(run) = f.take() else { return };
+        let mut run = Some(run);
+        match crate::with_app(|app| run.take().map(|g| g(app))) {
+            Some(Some(r)) => settle(r),
+            _ => {
+                if let Some(g) = run.take() {
+                    crate::post(move |app| settle(g(app)));
+                }
+            }
+        }
+    })
+}
+
+/// The project as File ▸ Save writes it (`.ecproj` JSON with the view state) and the revision it
+/// is: resolves with `{text, revision}`.
+#[wasm_bindgen(js_name = exportProject)]
+pub fn export_project() -> js_sys::Promise {
+    on_app(|app| {
+        let s = &app.session;
+        let text = s.project.to_file_json_with_view(&s.saved_view()).map_err(|e| e.to_string())?;
+        Ok(json!({"text": text, "revision": s.revision}))
+    })
+}
+
+/// Mark the project saved when it is still at `revision` (the host stored that revision's
+/// export). Returns whether it was marked.
+#[wasm_bindgen(js_name = markSaved)]
+pub fn mark_saved(revision: f64) -> bool {
+    crate::with_app(|app| {
+        let s = &mut app.session;
+        let same = s.revision as f64 == revision;
+        if same {
+            s.mark_saved();
+        }
+        same
+    })
+    .unwrap_or(false)
+}
+
+/// The session's revision (bumped by every change), or `undefined` before the app runs.
+#[wasm_bindgen]
+pub fn revision() -> Option<f64> {
+    crate::with_app(|app| app.session.revision as f64)
 }
 
 /// Backend and build facts.
