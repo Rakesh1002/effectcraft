@@ -90,6 +90,10 @@ pub fn repaint() {
 
 /// Open a project or import media from table paths (picked or dropped files).
 pub(crate) fn open_or_import(app: &mut EffectcraftApp, paths: Vec<String>) {
+    let (fonts, paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|p| effectcraft_engine::text::fonts::is_font_file(p));
+    for p in fonts {
+        crate::fonts::adopt(app, &p);
+    }
     let (projects, media): (Vec<String>, Vec<String>) = paths.into_iter().partition(|p| p.to_ascii_lowercase().ends_with(".ecproj"));
     if let Some(p) = projects.last()
         && let Err(e) = app.session.execute("file.open", json!({"path": p}))
@@ -178,6 +182,7 @@ fn query_value(name: &str) -> Option<String> {
 pub fn session() -> Session {
     let pool = Arc::new(effectcraft_media::MediaPool::new());
     persist::register_media(&pool);
+    crate::fonts::register_stored();
     POOL.with(|p| *p.borrow_mut() = Some(pool.clone()));
     Session {
         services: Arc::new(files::WebServices),

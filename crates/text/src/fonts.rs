@@ -340,6 +340,60 @@ pub fn add_font_data(data: Vec<u8>) -> Vec<FaceId> {
     ids
 }
 
+/// Whether a file name is a font file a project can bring (`.ttf` / `.otf`, any case).
+pub fn is_font_file(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("ttf") || ext.eq_ignore_ascii_case("otf"))
+}
+
+/// Register a font file a project brings (a brand font): its faces become available to text
+/// layers, listed with origin `project`. Returns the faces and whether the database changed:
+/// registering the same bytes again changes nothing; a file whose family and style are already
+/// registered from a project replaces that face in place, so face ids stay valid. A file that
+/// isn't a usable font is an error and registers nothing.
+pub fn add_project_font(data: Vec<u8>) -> Result<(Vec<FaceId>, bool), String> {
+    use skrifa::raw::TableProvider;
+    let names = read_faces_bytes(&data);
+    if names.is_empty() {
+        return Err("not a TrueType or OpenType font (no family name found)".into());
+    }
+    for n in &names {
+        let font = FontRef::from_index(&data, n.index).map_err(|e| format!("malformed font: {e}"))?;
+        font.head().map_err(|e| format!("malformed font: head table: {e}"))?;
+        font.cmap().map_err(|e| format!("malformed font: cmap table: {e}"))?;
+    }
+    let data = Arc::new(data);
+    let mut d = db().write().unwrap_or_else(|e| e.into_inner());
+    let mut ids = Vec::with_capacity(names.len());
+    let mut changed = false;
+    for n in names {
+        let same_face =
+            |g: &Arc<Face>| g.info.origin == "project" && g.info.family.eq_ignore_ascii_case(&n.family) && g.info.style.eq_ignore_ascii_case(&n.style);
+        let existing =
+            d.faces.iter().find(|g| same_face(g)).map(|g| (g.id, matches!(&g.info.data, FaceData::Shared(b) if **b == *data) && g.info.index == n.index));
+        let info = info_from(n, FaceData::Shared(data.clone()), "project");
+        match existing {
+            Some((id, true)) => ids.push(id),
+            Some((id, false)) => {
+                if let Some(slot) = d.faces.get_mut(id) {
+                    *slot = Arc::new(Face { id, info, bytes: OnceLock::new(), shaper: OnceLock::new() });
+                }
+                ids.push(id);
+                changed = true;
+            }
+            None => {
+                ids.push(push(&mut d, info));
+                changed = true;
+            }
+        }
+    }
+    drop(d);
+    if changed {
+        fallback_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
+        family_faces_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    Ok((ids, changed))
+}
+
 /// Held for a whole system scan: a concurrent caller waits for the complete list instead of
 /// returning early and resolving against a half-filled database.
 static SCAN: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1167,5 +1221,77 @@ mod tests {
         assert!(f.has_char('A') && f.has_char('Ж'));
         assert!(!f.has_char('\u{5d0}'), "Inter has no Hebrew");
         assert!(f.has_feature(b"liga") || f.has_feature(b"calt"));
+    }
+
+    const TEST_BLOCKS: &[u8] = include_bytes!("../tests/fixtures/EffectCraftTestBlocks.ttf");
+
+    fn utf16(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_be_bytes).collect()
+    }
+
+    /// The test font with its family name changed to `family` (same length as the original).
+    fn renamed_blocks(family: &str) -> Vec<u8> {
+        let (from, to) = (utf16("EffectCraft Test Blocks"), utf16(family));
+        assert_eq!(from.len(), to.len());
+        let mut data = TEST_BLOCKS.to_vec();
+        let mut i = 0;
+        while let Some(k) = data[i..].windows(from.len()).position(|w| w == from.as_slice()) {
+            data[i + k..i + k + to.len()].copy_from_slice(&to);
+            i += k + to.len();
+        }
+        data
+    }
+
+    #[test]
+    fn project_fonts_register_once_and_resolve() {
+        assert!(is_font_file("/fonts/Brand.TTF") && is_font_file("a.otf"));
+        assert!(!is_font_file("/fonts/brand.woff2") && !is_font_file("/fonts/ttf"));
+        let (ids, _) = add_project_font(TEST_BLOCKS.to_vec()).unwrap();
+        let &[id] = ids.as_slice() else { panic!("one face expected: {ids:?}") };
+        let f = face(id);
+        assert_eq!((f.info.family.as_str(), f.info.style.as_str(), f.info.origin), ("EffectCraft Test Blocks", "Regular", "project"));
+        assert!(f.glyph('A').is_some() && f.has_char('A'));
+        let r = resolve("effectcraft test blocks", "Regular");
+        assert_eq!((r.face, r.missing), (id, false));
+        assert!(families().iter().any(|(fam, styles)| fam == "EffectCraft Test Blocks" && styles == &["Regular"]));
+        let count = || all_faces().iter().filter(|f| f.info.family == "EffectCraft Test Blocks").count();
+        let before = count();
+        assert_eq!(add_project_font(TEST_BLOCKS.to_vec()).unwrap(), (ids, false), "registering again is a no-op");
+        assert_eq!(count(), before);
+    }
+
+    #[test]
+    fn a_changed_project_font_replaces_its_face_in_place() {
+        let first = renamed_blocks("EffectCraft Test Blockz");
+        let (ids, _) = add_project_font(first.clone()).unwrap();
+        let mut second = first;
+        let last = second.len() - 1;
+        second[last] ^= 0xff;
+        assert_eq!(add_project_font(second.clone()).unwrap(), (ids.clone(), true), "same family and style, same face id");
+        let f = face(ids[0]);
+        assert!(matches!(&f.info.data, FaceData::Shared(b) if **b == second));
+        assert_eq!(all_faces().iter().filter(|f| f.info.family == "EffectCraft Test Blockz").count(), 1);
+    }
+
+    #[test]
+    fn malformed_project_fonts_are_errors() {
+        assert!(add_project_font(b"not a font".to_vec()).is_err());
+        assert!(add_project_font(Vec::new()).is_err());
+        assert!(add_project_font(TEST_BLOCKS[..64].to_vec()).is_err(), "truncated");
+        let mut no_cmap = renamed_blocks("EffectCraft Test NoCmap");
+        let at = no_cmap.windows(4).position(|w| w == b"cmap").unwrap();
+        no_cmap[at..at + 4].copy_from_slice(b"xmap");
+        assert!(add_project_font(no_cmap).unwrap_err().contains("cmap"));
+        assert!(all_faces().iter().all(|f| f.info.family != "EffectCraft Test NoCmap"), "nothing registered");
+        for len in [12, 200, 1000, TEST_BLOCKS.len() / 2, TEST_BLOCKS.len() - 1] {
+            let mut cut = renamed_blocks("EffectCraft Test Cutoff");
+            cut.truncate(len);
+            if let Ok((ids, _)) = add_project_font(cut) {
+                for id in ids {
+                    let f = face(id);
+                    let _ = (f.glyph('A'), f.has_char('A'), f.metrics(24.0), f.units_per_em(), f.features());
+                }
+            }
+        }
     }
 }

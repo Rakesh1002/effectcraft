@@ -124,8 +124,9 @@ pub fn add_file(name: String, data: js_sys::Uint8Array) -> String {
 }
 
 /// Store bytes in the file table under `path` (`/assets/<id>/<name>`) without opening or
-/// importing them: a later `file.import` or `file.open` reads them from there. Returns the table
-/// path.
+/// importing them: a later `file.import` or `file.open` reads them from there. A `.ttf` / `.otf`
+/// under `/fonts/` is registered as a project font (an error, and not stored, when it isn't a
+/// usable font). Returns the table path.
 #[wasm_bindgen(js_name = putFile)]
 pub fn put_file(path: String, data: js_sys::Uint8Array) -> Result<String, JsValue> {
     let path = if path.starts_with('/') { path } else { format!("/{path}") };
@@ -133,11 +134,23 @@ pub fn put_file(path: String, data: js_sys::Uint8Array) -> Result<String, JsValu
         return Err(JsValue::from_str("putFile: the path names a folder"));
     }
     let bytes: Arc<[u8]> = data.to_vec().into();
+    if crate::fonts::is_font_path(&path) {
+        let (faces, changed) = crate::fonts::register(&path, &bytes).map_err(|e| JsValue::from_str(&format!("putFile: {e}")))?;
+        crate::files::put(&path, bytes);
+        crate::fonts::changed(&path, faces, changed);
+        return Ok(path);
+    }
     crate::files::put(&path, bytes.clone());
     if !crate::embed::is_project_path(&path) {
         crate::register_media(&path, bytes);
     }
     Ok(path)
+}
+
+/// The project fonts registered from `/fonts/`: `[{path, family, style, origin: "project"}]`.
+#[wasm_bindgen]
+pub fn fonts() -> JsValue {
+    to_js(&Value::Array(crate::fonts::list()))
 }
 
 /// Settle a promise with `f` run on the app: right away between frames, else at the next frame.

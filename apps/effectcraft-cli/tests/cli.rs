@@ -518,3 +518,76 @@ fn render_progress_jsonl() {
     let last: Value = serde_json::from_str(String::from_utf8_lossy(&o.stderr).lines().last().unwrap()).unwrap();
     assert!(last["error"].as_str().is_some_and(|e| !e.is_empty()), "{last}");
 }
+
+/// `--font-dir` (comotion P5): a project whose text uses a font that isn't installed renders in
+/// that font once its folder is given, and in the fallback font without it; with the folder, a
+/// family still missing is a warning line (a JSON line in jsonl progress mode), and a file that
+/// isn't a font is a warning, not a failure.
+#[test]
+fn render_frame_with_font_dir() {
+    let fonts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/text/tests/fixtures");
+    let fonts = fonts.to_str().unwrap();
+    let project = tmp("brand-font.ecproj");
+    let text = |font: &str| json!({"text": "Brand", "font": font, "size": 120}).to_string();
+    ok_json(&[
+        "run",
+        "--empty",
+        "comp.new",
+        r#"{"name": "C", "width": 480, "height": 270, "duration": 1}"#,
+        "layer.newText",
+        &text("EffectCraft Test Blocks"),
+        "--save-as",
+        project.to_str().unwrap(),
+    ]);
+    let render = |out: &str, extra: &[&str]| -> (Vec<u8>, String) {
+        let out = tmp(out);
+        let o = bin().args(["render-frame", "--project", project.to_str().unwrap(), "--out", out.to_str().unwrap()]).args(extra).output().unwrap();
+        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success(), "{stderr}");
+        (image::open(&out).unwrap().to_rgba8().into_raw(), stderr)
+    };
+    let (branded, stderr) = render("brand-font.png", &["--font-dir", fonts]);
+    assert!(!stderr.contains("warning"), "{stderr}");
+    let (fallback, _) = render("fallback-font.png", &[]);
+    assert_eq!(branded.len(), fallback.len());
+    let differ = branded.chunks(4).zip(fallback.chunks(4)).filter(|(a, b)| a != b).count();
+    assert!(differ > 1000, "only {differ} pixels differ from the fallback font");
+
+    let missing = tmp("missing-font.ecproj");
+    ok_json(&[
+        "run",
+        "--empty",
+        "comp.new",
+        r#"{"name": "C", "width": 160, "height": 90, "duration": 1}"#,
+        "layer.newText",
+        &text("No Such Brand Font"),
+        "--save-as",
+        missing.to_str().unwrap(),
+    ]);
+    let bad_dir = tmp("bad-fonts");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    std::fs::write(bad_dir.join("broken.ttf"), b"\0\x01\0\0not really a font").unwrap();
+    let frame = tmp("missing-font.png");
+    let o = bin()
+        .args(["render-frame", "--project", missing.to_str().unwrap(), "--font-dir", bad_dir.to_str().unwrap(), "--out", frame.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{stderr}");
+    assert!(stderr.contains("warning: missing font: No Such Brand Font"), "{stderr}");
+    assert!(stderr.contains("warning: cannot load font") && stderr.contains("broken.ttf"), "{stderr}");
+
+    let gif = tmp("missing-font.gif");
+    let o = bin()
+        .env("EFFECTCRAFT_PROGRESS", "jsonl")
+        .args(["render", "--project", missing.to_str().unwrap(), "--font-dir", fonts, "--end", "0.2", "--out", gif.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let lines: Vec<Value> = String::from_utf8_lossy(&o.stderr).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(lines.contains(&json!({"warning": "missing font: No Such Brand Font"})), "{lines:?}");
+    assert_eq!(lines.last().unwrap()["done"], true, "{lines:?}");
+
+    let o = bin().args(["render-frame", "--empty", "--font-dir", "/nonexistent/fonts", "--out", frame.to_str().unwrap()]).output().unwrap();
+    assert!(!o.status.success());
+}

@@ -6,12 +6,16 @@
 // Memory storage and an empty start; putFile stores without importing; exportProject returns
 // the File > Save text and the revision; markSaved only marks the revision it was given;
 // `effectcraft:revision`, `effectcraft:save-request`, `effectcraft:output` and
-// `effectcraft:import-request` fire, and nothing downloads. With the tab hidden (another tab in
+// `effectcraft:import-request` fire, and nothing downloads. A font put under `/fonts/` is
+// registered (listed by `text.fonts` and `fonts()`, `effectcraft:fonts-changed`; again is a no-op,
+// a malformed one is an error) and text in its family renders with it on the page, in a frame
+// worker and in a Render Queue job worker. With the tab hidden (another tab in
 // front: no animation frames) `execute` and `renderFrame` still resolve. Prints a JSON report; exits non-zero
 // on failure.
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 
 const arg = (k, d) => {
@@ -106,14 +110,29 @@ try {
   await send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: downloads, eventsEnabled: true });
   await send("Page.addScriptToEvaluateOnNewDocument", {
     source: `window.__ec = [];
-      for (const name of ["effectcraft:revision", "effectcraft:save-request", "effectcraft:output", "effectcraft:import-request"]) {
+      for (const name of ["effectcraft:revision", "effectcraft:save-request", "effectcraft:output", "effectcraft:import-request", "effectcraft:fonts-changed"]) {
         window.addEventListener(name, (e) => {
           const d = e.detail || {};
           window.__ec.push({ name, detail: name === "effectcraft:import-request"
             ? { kind: d.kind, files: (d.files || []).map((f) => ({ name: f.name, size: f.size, isFile: f instanceof File })) }
             : d });
         });
-      }`,
+      }
+      window.__pixels = async (png) => {
+        const bmp = await createImageBitmap(new Blob([Uint8Array.from(atob(png), (c) => c.charCodeAt(0))], { type: "image/png" }));
+        const g = new OffscreenCanvas(bmp.width, bmp.height).getContext("2d");
+        g.drawImage(bmp, 0, 0);
+        return g.getImageData(0, 0, bmp.width, bmp.height).data;
+      };
+      window.__diff = async (a, b) => {
+        const [x, y] = [await window.__pixels(a), await window.__pixels(b)];
+        if (x.length !== y.length) return { pixels: x.length / 4, differing: -1 };
+        let differing = 0;
+        for (let i = 0; i < x.length; i += 4) {
+          if (Math.max(Math.abs(x[i] - y[i]), Math.abs(x[i + 1] - y[i + 1]), Math.abs(x[i + 2] - y[i + 2]), Math.abs(x[i + 3] - y[i + 3])) > 8) differing++;
+        }
+        return { pixels: x.length / 4, differing };
+      };`,
   });
   await send("Page.navigate", { url: new URL("?embed", base).href });
   await until("!!(window.effectcraftLoad && (window.effectcraftLoad.readyMs || window.effectcraftLoad.error))", 180000);
@@ -174,6 +193,51 @@ try {
   const gifBytes = await js(`effectcraft.readFile(${JSON.stringify(gif)})?.length ?? 0`);
   check(gifBytes > 0, "render output stays in the file table");
   report.steps.render = { path: gif, bytes: gifBytes };
+
+  const fontPath = "/fonts/EffectCraftTestBlocks.ttf";
+  const font = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../../crates/text/tests/fixtures/EffectCraftTestBlocks.ttf")).toString("base64");
+  const putFont = `effectcraft.putFile(${JSON.stringify(fontPath)}, Uint8Array.from(atob("${font}"), (c) => c.charCodeAt(0)))`;
+  check((await js(putFont)) === fontPath, "putFile stores the font");
+  await until(`window.__ec.some((e) => e.name === "effectcraft:fonts-changed")`);
+  const fontEvent = (await events("effectcraft:fonts-changed"))[0].detail;
+  const family = "EffectCraft Test Blocks";
+  check(fontEvent.changed && fontEvent.faces[0]?.family === family, `fonts-changed ${JSON.stringify(fontEvent)}`);
+  const listedFonts = await js(`effectcraft.execute("text.fonts", {query: "test blocks"})`);
+  check(listedFonts.families[0]?.family === family && listedFonts.families[0].origin === "project", `text.fonts ${JSON.stringify(listedFonts)}`);
+  const registered = await js("effectcraft.fonts()");
+  check(registered.length === 1 && registered[0].path === fontPath && registered[0].origin === "project", `fonts() ${JSON.stringify(registered)}`);
+  await js(putFont);
+  await until(`window.__ec.filter((e) => e.name === "effectcraft:fonts-changed").length === 2`);
+  const again = (await events("effectcraft:fonts-changed"))[1].detail;
+  check(!again.changed && (await js("effectcraft.fonts()")).length === 1, "registering again changes nothing");
+  const bad = await js(`(() => { try { effectcraft.putFile("/fonts/bad.ttf", new Uint8Array([0, 1, 0, 0, 7, 7, 7])); return "accepted"; } catch (e) { return String(e); } })()`);
+  check(bad.includes("bad.ttf") && !(await js(`effectcraft.files().some((f) => f.path === "/fonts/bad.ttf")`)), `malformed font: ${bad}`);
+  check(await js("effectcraft.revision() !== undefined"), "still running after a malformed font");
+
+  await js(`effectcraft.execute("comp.new", {name: "Fonts", width: 320, height: 180, duration: 1})`);
+  const text = (await js(`effectcraft.execute("layer.newText", {text: "Brand", font: ${JSON.stringify(family)}, size: 90})`)).layer;
+  await js(`window.__brand = (await effectcraft.renderFrame({time: 0})).png`);
+  await js(`effectcraft.execute("layer.setText", {layer: ${text}, font: "No Such Brand Font"})`);
+  await js(`window.__fallback = (await effectcraft.renderFrame({time: 0})).png`);
+  const pageDiff = await js("window.__diff(window.__brand, window.__fallback)");
+  check(pageDiff.differing > 500, `the project font renders differently from the fallback: ${JSON.stringify(pageDiff)}`);
+  await js(`effectcraft.execute("layer.setText", {layer: ${text}, font: ${JSON.stringify(family)}})`);
+  let workerCheck = null;
+  for (let i = 0; i < 50 && !workerCheck; i++) {
+    workerCheck = await js(`effectcraft.workerFrameCheck({time: 0, scale: 1, backend: "cpu"}).catch(() => null)`);
+    if (!workerCheck) await sleep(200);
+  }
+  check(workerCheck && workerCheck.over4 < 0.001, `frame worker renders the project font: ${JSON.stringify(workerCheck)}`);
+  const outputsBefore = (await events("effectcraft:output")).length;
+  await js(`effectcraft.execute("renderQueue.add", {output: "/fonts-job.png", start: 0, end: 0.01})`);
+  await js(`effectcraft.request("ui.menu.invoke", {command: "renderQueue.render"})`);
+  await until(`window.__ec.filter((e) => e.name === "effectcraft:output").slice(${outputsBefore}).some((e) => e.detail.paths.some((p) => p.endsWith(".png")))`, 180000);
+  const jobPng = (await events("effectcraft:output")).slice(outputsBefore).flatMap((e) => e.detail.paths).find((p) => p.endsWith(".png"));
+  await js(`window.__job = (() => { const b = effectcraft.readFile(${JSON.stringify(jobPng)}); let s = ""; for (const x of b) s += String.fromCharCode(x); return btoa(s); })()`);
+  const jobVsBrand = await js("window.__diff(window.__job, window.__brand)");
+  const jobVsFallback = await js("window.__diff(window.__job, window.__fallback)");
+  check(jobVsBrand.differing >= 0 && jobVsBrand.differing * 10 < jobVsFallback.differing, `job worker renders the project font: brand ${JSON.stringify(jobVsBrand)}, fallback ${JSON.stringify(jobVsFallback)}`);
+  report.steps.fonts = { event: fontEvent, registered, malformed: bad, pageDiff, workerCheck, job: { path: jobPng, vsBrand: jobVsBrand, vsFallback: jobVsFallback } };
 
   await send("Page.setInterceptFileChooserDialog", { enabled: true });
   await js(`effectcraft.request("ui.menu.invoke", {command: "file.import"})`);

@@ -84,6 +84,7 @@
       exportProject: () => ec.exportProject(),
       markSaved: (revision) => ec.markSaved(revision),
       revision: () => ec.revision(),
+      fonts: () => ec.fonts(),
       // A frame rendered in a frame worker (its GPU by default) vs the page's CPU: {maxDiff, meanDiff, over4, …}.
       workerFrameCheck: (params) => ec.workerFrameCheck(params ?? {}).then(JSON.parse),
     };

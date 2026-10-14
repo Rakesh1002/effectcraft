@@ -47,7 +47,8 @@ struct Fw {
     mirror: Mirror,
     /// The footage files it was sent, with their versions (a replaced file goes again).
     files: HashMap<String, u64>,
-    busy: Option<(u64, RemoteDone)>,
+    /// The frame it renders: request id, completion, and the font set's generation when sent.
+    busy: Option<(u64, RemoteDone, u64)>,
     alive: bool,
     /// Its GPU adapter (after it reported), or why it has none.
     gpu: Option<Result<String, String>>,
@@ -114,9 +115,9 @@ impl WebFrames {
             s.next_id += 1;
             let id = s.next_id;
             let Some(k) = s.workers.iter().position(|w| w.alive && w.busy.is_none()) else { return Err((done, "no idle frame worker".to_string())) };
-            // Footage the worker hasn't got yet.
+            // Footage and project fonts the worker hasn't got yet.
             let w = &mut s.workers[k];
-            for p in footage_files(&job.project) {
+            for p in footage_files(&job.project).into_iter().chain(crate::fonts::paths()) {
                 let Some((d, version)) = crate::files::get_versioned(&p) else { continue };
                 if w.files.get(&p) == Some(&version) {
                     continue;
@@ -143,7 +144,7 @@ impl WebFrames {
                 &obj(&[("type", "frame".into()), ("json", serde_json::to_string(&req).unwrap_or_default().into())]),
                 &js_sys::Array::new(),
             );
-            s.workers[k].busy = Some((id, done));
+            s.workers[k].busy = Some((id, done, crate::fonts::generation()));
             if sent > 0 {
                 s.syncs += 1;
                 s.sync_bytes += sent;
@@ -209,13 +210,17 @@ fn on_message(index: u32, json: JsValue, bytes: JsValue, error: JsValue) {
         if let Some(e) = error.as_string() {
             log::warn!("frame worker {index}: {e}; frames render on the page's thread if none is left");
             w.alive = false;
-            return w.busy.take().map(|(_, d)| (d, Err(e)));
+            return w.busy.take().map(|(_, d, _)| (d, Err(e)));
         }
         let reply: FrameReply = serde_json::from_str(&json.as_string()?).ok()?;
         match reply {
             FrameReply::Frame { id, width, height, ms, passes, gpu, layer_misses, layer_hits } => {
                 crate::diskcache::note_layers(&layer_misses, &layer_hits);
-                let (_, d) = w.busy.take_if(|b| b.0 == id)?;
+                let (_, d, fonts) = w.busy.take_if(|b| b.0 == id)?;
+                // A project font arrived while it rendered: the viewer asks for it again.
+                if fonts != crate::fonts::generation() {
+                    return Some((d, Err("the project fonts changed while it rendered".into())));
+                }
                 let rgba = bytes.dyn_into::<js_sys::Uint8Array>().map(|b| b.to_vec()).unwrap_or_default();
                 st.rendered += 1;
                 st.last_ms = ms;
@@ -227,7 +232,7 @@ fn on_message(index: u32, json: JsValue, bytes: JsValue, error: JsValue) {
             }
             FrameReply::Failed { id, error, .. } => {
                 st.failed += 1;
-                let (_, d) = w.busy.take_if(|b| b.0 == id)?;
+                let (_, d, _) = w.busy.take_if(|b| b.0 == id)?;
                 Some((d, Err(error)))
             }
             FrameReply::Resync { error } => {
@@ -417,6 +422,15 @@ fn new_server() -> FrameServer {
     let mut s = FrameServer::new(crate::worker::pool(), Some(Arc::new(effectcraft_expr::Expressions)));
     s.set_layer_store(Some(Arc::new(effectcraft_engine::render::PrefetchStore::default())));
     s
+}
+
+/// Drop the frame server's cached layer buffers (worker side: a project font arrived).
+pub(crate) fn purge_server() {
+    SERVER.with(|c| {
+        if let Some(s) = c.borrow_mut().as_mut() {
+            s.handle(FrameMsg::Purge);
+        }
+    });
 }
 
 /// Set up a frame worker (called once by `web/worker.js` after `workerInit`): its frame

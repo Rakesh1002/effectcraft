@@ -19,6 +19,8 @@
 //! effectcraft-cli render --template T.ectemplate [--values V.json] --out FILE
 //! effectcraft-cli render-frame --template T.ectemplate [--values V.json] [--time S] [--out F.png]
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
+//! effectcraft-cli render|render-frame ... --font-dir DIR      register DIR's .ttf/.otf fonts first; warn about
+//!     text in families that are still missing
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
@@ -107,6 +109,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            --profile..--keyint: HEVC / AV1, --audio-bitrate/--opus-app: WebM Opus)
                                            a relative --out is relative to the working directory
   render/render-frame --template T.ectemplate [--values V.json]   render one template instance
+  render/render-frame ... --font-dir DIR   register every .ttf/.otf in DIR before the project loads (repeatable);
+                                           text in a family still missing renders in the fallback font with a
+                                           warning (a JSON warning line with EFFECTCRAFT_PROGRESS=jsonl)
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
@@ -147,6 +152,7 @@ const VALUED: &[&str] = &[
     // render
     "--template",
     "--values",
+    "--font-dir",
     "--format",
     "--start",
     "--end",
@@ -326,6 +332,9 @@ fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
         if args.project.is_some() || args.flag("--demo") {
             return usage_err("--bridge drives the running app's project; use `exec file.open` to open another");
         }
+        if args.opt("--font-dir").is_some() {
+            return usage_err("--font-dir registers fonts for headless renders, not for a bridged app");
+        }
         return Ok(Backend::bridge(addr)?);
     }
     let mut b = Backend::headless(session(args)?);
@@ -338,8 +347,10 @@ fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
 }
 
 /// A wired session; `--gpu` attaches the GPU compositor (renders then follow the project's
-/// renderer setting, Mercury GPU Acceleration by default).
+/// renderer setting, Mercury GPU Acceleration by default). `--font-dir` fonts are registered
+/// first.
 fn session(args: &Args) -> Result<effectcraft_engine::Session, Failure> {
+    load_font_dirs(args)?;
     let mut s = effectcraft_host::session();
     if args.flag("--autosave") {
         let dir = effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
@@ -359,6 +370,64 @@ fn session(args: &Args) -> Result<effectcraft_engine::Session, Failure> {
         s.accel_note = Some("headless: renders on the CPU unless started with --gpu".into());
     }
     Ok(s)
+}
+
+/// A warning on stderr: a JSON line `{"warning": …}` with `EFFECTCRAFT_PROGRESS=jsonl`.
+fn warn(message: &str) {
+    if progress_jsonl() {
+        note!("{}", json!({"warning": message}));
+    } else {
+        note!("effectcraft-cli: warning: {message}");
+    }
+}
+
+/// Fonts larger than this are not read (the largest CJK families are about 30 MB).
+const MAX_FONT_BYTES: u64 = 128 << 20;
+
+/// `--font-dir DIR` (repeatable): register every `.ttf` / `.otf` in DIR as a project font. A
+/// missing folder is an error; a file that isn't a usable font is a warning.
+fn load_font_dirs(args: &Args) -> Result<(), Failure> {
+    use effectcraft_engine::text::fonts;
+    for dir in args.opts("--font-dir") {
+        let entries = std::fs::read_dir(dir).map_err(|e| Failure::Error(format!("--font-dir {dir}: {e}")))?;
+        let mut files: Vec<std::path::PathBuf> =
+            entries.flatten().map(|e| e.path()).filter(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()).is_some_and(fonts::is_font_file)).collect();
+        files.sort();
+        for f in files {
+            let loaded = match std::fs::metadata(&f) {
+                Ok(m) if m.len() > MAX_FONT_BYTES => Err(format!("larger than {} MB", MAX_FONT_BYTES >> 20)),
+                Ok(_) => std::fs::read(&f).map_err(|e| e.to_string()).and_then(fonts::add_project_font),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = loaded {
+                warn(&format!("cannot load font {}: {e}", f.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// With `--font-dir`: a warning per font family the project's text uses that resolves to the
+/// fallback font.
+fn warn_missing_fonts(args: &Args, s: &effectcraft_engine::Session) {
+    if args.opt("--font-dir").is_none() {
+        return;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, c) in s.project.comps() {
+        for l in &c.layers {
+            let Some(p) = l.props.prop("text/sourceText") else { continue };
+            for doc in std::iter::once(&p.value).chain(p.keys.iter().map(|k| &k.value)).filter_map(|v| v.as_text()) {
+                let runs = doc.runs();
+                let faces = std::iter::once((doc.font.clone(), doc.style.clone())).chain(runs.into_iter().map(|r| (r.style.font, r.style.style)));
+                for (family, style) in faces {
+                    if seen.insert(family.to_lowercase()) && effectcraft_engine::text::resolve(&family, &style).missing {
+                        warn(&format!("missing font: {family}"));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `--save` / `--save-as` after a mutating command.
@@ -575,6 +644,9 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             } else {
                 backend(args, true)?
             };
+            if let Some(s) = b.session() {
+                warn_missing_fonts(args, s);
+            }
             let comp = args.opt("--comp").and_then(reference);
             let mut time = args.num("--time")?;
             let mut max_side = args.num("--max-side")?.map(|m| m as u32).unwrap_or(0);
@@ -707,6 +779,7 @@ fn render(args: &Args, json_out: bool) -> Result<Vec<String>, Failure> {
             None => s.execute("file.openDemoProject", json!({})).map_err(|e| Failure::Error(e.to_string()))?,
         };
     }
+    warn_missing_fonts(args, &s);
     let err = |e: effectcraft_engine::EngineError| Failure::Error(e.to_string());
     if !args.flag("--queue") {
         let Some(out) = args.opt("--out") else { return usage_err("render: --out FILE is required (or --queue)") };

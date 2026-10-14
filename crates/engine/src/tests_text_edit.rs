@@ -332,3 +332,35 @@ fn set_text_schema_accepts_every_opentype_key_and_requires_none() {
     s.execute_checked("layer.setText", json!({"layer": t, "discretionaryLigatures": true, "ss02": true, "ss20": true})).unwrap();
     assert!(doc(&s, t).style_at(0).opentype.stylistic_set(20));
 }
+
+/// A project font (comotion P5): registered, it is listed with origin `project`, text set in it
+/// renders with its glyphs instead of the fallback, and a saved project names it by family, so
+/// it reopens in that font once the same file is registered again.
+#[test]
+fn project_fonts_render_and_survive_save_and_reopen() {
+    const FAMILY: &str = "EffectCraft Test Blocks";
+    let bytes = include_bytes!("../../text/tests/fixtures/EffectCraftTestBlocks.ttf").to_vec();
+    effectcraft_text::fonts::add_project_font(bytes.clone()).unwrap();
+    let (mut s, t) = session("Brand");
+    let listed = s.execute("text.fonts", json!({"query": "test blocks"})).unwrap();
+    assert_eq!(listed["families"][0]["family"], FAMILY, "{listed}");
+    assert_eq!(listed["families"][0]["origin"], "project");
+    let comp = s.active_comp_id().unwrap();
+    let render = |s: &Session| s.render_rgba8(comp, effectcraft_time::Tick::ZERO, 0).unwrap().2;
+    let fallback = render(&s);
+    s.execute("layer.setText", json!({"layer": t, "font": FAMILY})).unwrap();
+    let branded = render(&s);
+    let differ = fallback.chunks(4).zip(branded.chunks(4)).filter(|(a, b)| a != b).count();
+    assert!(differ > 500, "only {differ} pixels differ from the fallback font");
+    let dir = std::env::temp_dir().join(format!("ec-project-font-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("brand.ecproj").to_string_lossy().to_string();
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    effectcraft_text::fonts::add_project_font(bytes).unwrap();
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!(doc(&s2, t).font, FAMILY);
+    let comp2 = s2.active_comp_id().unwrap();
+    assert_eq!(s2.render_rgba8(comp2, effectcraft_time::Tick::ZERO, 0).unwrap().2, branded);
+    let _ = std::fs::remove_dir_all(dir);
+}
