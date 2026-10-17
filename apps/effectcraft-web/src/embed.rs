@@ -8,7 +8,9 @@
 //!   written files and render outputs stay in the file table and raise `effectcraft:output
 //!   {paths}`;
 //! - a change of the session's revision or modified state raises `effectcraft:revision
-//!   {revision, dirty}`.
+//!   {revision, dirty}`;
+//! - the menus, shortcuts and header leave out what the host page owns or a page can't do
+//!   ([`HIDDEN`]).
 //!
 //! Events are dispatched on `window` from a microtask, after the frame, so a listener can call
 //! back into `window.effectcraft` right away.
@@ -16,6 +18,94 @@
 //! A hidden page gets no animation frames, so the control channel (`execute`, `request`,
 //! `renderFrame`) would wait for the tab to show again; while hidden, requests are served between
 //! frames instead ([`ControlPump`]).
+
+/// Menu entries, shortcuts and header buttons an embedded page leaves out
+/// ([`effectcraft_engine::menus::Hidden`]): the host owns the project (new, open, recent, save
+/// as, revert, demo, templates, the Home screen); the desktop's windows, folders and file
+/// managers; disk cache, scripts and plug-ins; pickers whose file would reach the host as an
+/// import instead of the command; files written for a download nobody receives; the upstream
+/// project's help and links.
+pub const HIDDEN: &[&str] = &[
+    "app.hide",
+    "app.hideOthers",
+    "app.showAll",
+    "app.quit",
+    "app.home",
+    "file.newProject",
+    "file.newFromTemplate",
+    "file.open",
+    "@dynamic:recentProjects",
+    "file.openRecent",
+    "file.clearRecent",
+    "file.closeProject",
+    "file.saveAs",
+    "file.saveCopy",
+    "file.saveCopyAsXml",
+    "templates.saveAs",
+    "file.incrementAndSave",
+    "file.revert",
+    "file.importTimeline",
+    "file.importProject",
+    "file.importLottie",
+    "file.importVanishingPoint",
+    "essential.importTemplate",
+    "@dynamic:recentFootage",
+    "file.importRecent",
+    "file.clearRecentFootage",
+    "file.exportTimeline",
+    "file.exportLottie",
+    "essential.exportTemplate",
+    "file.collectFiles",
+    "file.relinkFootage",
+    "file.watchFolder",
+    "@dynamic:scripts",
+    "file.installScript",
+    "file.installScriptUIPanel",
+    "file.runScript",
+    "file.createProxy",
+    "file.setProxy",
+    "file.setProxyNone",
+    "file.replaceFootage",
+    "file.revealInFinder",
+    "file.openDemoProject",
+    r#"edit.purge {"what":"disk"}"#,
+    r#"edit.purge {"what":"memoryAndDisk"}"#,
+    "edit.editOriginal",
+    r#"app.settings {"page":"startup"}"#,
+    r#"app.settings {"page":"project"}"#,
+    r#"app.settings {"page":"export"}"#,
+    r#"app.settings {"page":"disk"}"#,
+    r#"app.settings {"page":"memory"}"#,
+    r#"app.settings {"page":"video"}"#,
+    "comp.saveFrameAs",
+    "comp.saveFrameAsPsd",
+    "comp.saveFrameAsExr",
+    "render.saveCurrentPreview",
+    "layer.revealInFinder",
+    "effect.plugins.load",
+    "anim.savePreset",
+    "anim.applyPreset",
+    "keys.rpfCameraImport",
+    "view.importGuides",
+    "view.exportGuides",
+    "view.fullScreen",
+    r#"window.panel {"panel":"mediaBrowser"}"#,
+    r#"window.panel {"panel":"scriptConsole"}"#,
+    "@dynamic:scriptPanels",
+    "window.scriptPanel",
+    r#"window.workspace {"name":"Learn"}"#,
+    "help.inAppTutorials",
+    "window.maximizeApp",
+    "window.panelWindow",
+    "help.docs",
+    "help.onlineTutorials",
+    "help.systemReport",
+    "help.enableLogging",
+    "help.revealLogFile",
+    "help.reportIssue",
+    "help.appPage",
+    "help.github",
+];
 
 /// A project file the host saves (`.ecproj`, or its XML form).
 pub fn is_project_path(path: &str) -> bool {
@@ -164,6 +254,64 @@ mod web {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_rules_name_menu_entries_and_keep_the_editing_menus() {
+        use effectcraft_engine::menus::{self, Hidden, MenuNode};
+        // UI commands (ui-egui's `UI_COMMANDS`, not built natively here).
+        const UI_ONLY: [&str; 3] = ["app.home", "window.maximizeApp", "window.panelWindow"];
+        let hidden = Hidden::new(HIDDEN).unwrap();
+        let entries = menus::entries();
+        for rule in HIDDEN {
+            let id = rule.split(' ').next().unwrap();
+            if let Some(name) = id.strip_prefix("@dynamic:") {
+                assert!(menus::TREE.contains(&format!("@dynamic:{name}")), "{rule}");
+            } else if rule.contains(' ') {
+                assert!(entries.iter().any(|(_, e)| e.command == id && hidden.command(&e.command, &e.params)), "{rule} matches no menu entry");
+            } else {
+                assert!(effectcraft_engine::commands::find(id).is_some() || UI_ONLY.contains(&id), "{rule}");
+            }
+        }
+        // The web's menus are the non-macOS tree.
+        let web = menus::parse(menus::TREE, false).unwrap();
+        let shown = |path: &[&str]| -> Vec<String> {
+            let mut nodes = &web[..];
+            for label in path {
+                let Some(MenuNode::Submenu { children, .. }) = nodes.iter().find(|n| matches!(n, MenuNode::Submenu { label: l, .. } if l == label)) else {
+                    return vec![];
+                };
+                nodes = children;
+            }
+            hidden
+                .shown(nodes)
+                .into_iter()
+                .map(|n| match n {
+                    MenuNode::Item(e) => e.command.clone(),
+                    MenuNode::Submenu { label, .. } => label.clone(),
+                    MenuNode::Separator => "---".into(),
+                    MenuNode::Dynamic { name } => format!("@{name}"),
+                })
+                .collect()
+        };
+        let file = shown(&["File"]);
+        for kept in ["New", "file.close", "file.save", "Import", "Export", "Interpret Footage", "Replace Footage", "file.projectSettings"] {
+            assert!(file.contains(&kept.to_string()), "File keeps {kept}: {file:?}");
+        }
+        for gone in ["Open Recent", "Save As", "Scripts", "Create Proxy", "Set Proxy", "Import Recent Footage", "Watch Folder"] {
+            assert!(!file.contains(&gone.to_string()), "File drops {gone}: {file:?}");
+        }
+        assert_eq!(shown(&["File", "New"]), ["project.newFolder"]);
+        assert_eq!(shown(&["File", "Import"]), ["file.import", "file.importMultiple", "file.importPlaceholder", "file.importSolid"]);
+        assert_eq!(shown(&["File", "Export"]), ["renderQueue.add"]);
+        assert!(!shown(&["Composition"]).contains(&"Save Frame As".to_string()));
+        let help = shown(&["Help"]);
+        assert!(help.contains(&"app.about".to_string()) && !help.contains(&"help.github".to_string()), "{help:?}");
+        for menu in ["File", "Edit", "Composition", "Layer", "Effect", "Animation", "View", "Window", "Help"] {
+            let items = shown(&[menu]);
+            assert!(items.first().is_some_and(|f| f != "---") && items.last().is_some_and(|l| l != "---"), "{menu}: {items:?}");
+            assert!(!items.windows(2).any(|w| w[0] == "---" && w[1] == "---"), "{menu}: {items:?}");
+        }
+    }
 
     #[test]
     fn project_paths_are_the_host_saves() {

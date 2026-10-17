@@ -1584,6 +1584,7 @@ pub(crate) fn entry_enabled(app: &EffectcraftApp, e: &MenuEntry) -> bool {
 pub fn menu_items(app: &EffectcraftApp) -> Vec<MenuItem> {
     effectcraft_engine::menus::entries()
         .into_iter()
+        .filter(|(_, e)| !app.hooks.hidden.command(&e.command, &e.params))
         .map(|(path, e)| MenuItem {
             id: e.command.clone(),
             label: entry_label(app, e),
@@ -1876,7 +1877,8 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     if events.is_empty() {
         return;
     }
-    let binds = bindings(&app.session);
+    let mut binds = bindings(&app.session);
+    binds.retain(|(_, _, id, params)| !app.hooks.hidden.command(id, params));
     for (key, mods, pressed, physical_key) in events {
         // Plain Spacebar runs its shortcut (Play Current Preview) on the release: held, it is
         // the Hand tool (After Effects), and a drag with it must not start or stop playback.
@@ -1941,7 +1943,7 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
         let physical = physical_key.and_then(|key| {
             app.session.shortcuts().bindings().into_iter().find_map(|(sc, b)| {
                 let (m, k) = parse_shortcut(sc.strip_prefix("Physical+")?)?;
-                (k == key && mods_match(m, mods)).then(|| (b.command.clone(), b.params.clone()))
+                (k == key && mods_match(m, mods) && !app.hooks.hidden.command(&b.command, &b.params)).then(|| (b.command.clone(), b.params.clone()))
             })
         });
         if let Some((id, params)) = physical {
@@ -2018,7 +2020,7 @@ fn menu_nodes(
     nav: &mut crate::menu_keys::Nav,
     depth: usize,
 ) {
-    for n in nodes {
+    for n in app.hooks.hidden.shown(nodes) {
         match n {
             MenuNode::Separator => {
                 ui.separator();
@@ -2106,6 +2108,7 @@ pub(crate) fn submenu_at(app: &mut EffectcraftApp, ui: &mut egui::Ui, path: &[&s
 /// The menu bar's entry for `command` in a panel's context menu (see [`submenu_at`]).
 pub(crate) fn entry_for(app: &EffectcraftApp, ui: &mut egui::Ui, command: &str, clicked: &mut Option<(String, Value)>) {
     if let Some((_, e)) = effectcraft_engine::menus::entries().into_iter().find(|(_, e)| e.command == command)
+        && !app.hooks.hidden.command(&e.command, &e.params)
         && menu_entry(app, ui, e).clicked()
     {
         *clicked = Some((e.command.clone(), e.params_or_empty()));

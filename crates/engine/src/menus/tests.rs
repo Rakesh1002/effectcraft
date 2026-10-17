@@ -179,3 +179,37 @@ fn m3_13_entries_follow_after_effects() {
     }
     assert_eq!(platform_label("Reveal Layer Source in Project", false), "Reveal Layer Source in Project");
 }
+
+#[test]
+fn hidden_entries_match_by_command_bound_params_or_dynamic_name() {
+    let h = Hidden::new(&["file.open", r#"app.settings {"page":"disk"}"#, "@dynamic:scripts"]).unwrap();
+    assert!(h.command("file.open", &Value::Null));
+    assert!(h.command("app.settings", &serde_json::json!({"page": "disk"})));
+    assert!(!h.command("app.settings", &serde_json::json!({"page": "general"})));
+    assert!(!h.command("app.settings", &Value::Null));
+    assert!(!h.command("file.save", &Value::Null));
+    assert!(h.is_hidden(&MenuNode::Dynamic { name: "scripts".into() }));
+    assert!(!h.is_hidden(&MenuNode::Dynamic { name: "history".into() }));
+    assert!(Hidden::new(&["file.open {nope}"]).is_err());
+    assert!(!Hidden::default().command("file.open", &Value::Null));
+}
+
+#[test]
+fn shown_drops_hidden_entries_empty_submenus_and_stray_separators() {
+    let tree = parse(
+        "File\n  Open | file.open\n  ---\n  Save | file.save\n  ---\n  Recent\n    @dynamic:recentProjects\n    ---\n    Clear | file.clearRecent\n  ---\n  Quit | app.quit\n  ---\n  Find | app.find\n  ---\n  Exit | app.quit\n",
+        false,
+    )
+    .unwrap();
+    let MenuNode::Submenu { children, .. } = &tree[0] else { panic!() };
+    let label = |n: &&MenuNode| match n {
+        MenuNode::Item(e) => e.label.clone(),
+        MenuNode::Separator => "---".into(),
+        MenuNode::Submenu { label, .. } => format!("{label} ▸"),
+        MenuNode::Dynamic { name } => format!("@{name}"),
+    };
+    assert_eq!(Hidden::default().shown(children).len(), children.len());
+    let h = Hidden::new(&["file.open", "file.clearRecent", "@dynamic:recentProjects", "app.quit"]).unwrap();
+    let shown: Vec<String> = h.shown(children).iter().map(label).collect();
+    assert_eq!(shown, ["Save", "---", "Find"]);
+}

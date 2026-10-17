@@ -225,3 +225,40 @@ fn import_dialog_offers_mxf() {
     assert!(offered.iter().any(|e| e == "mxf"), "offered {offered:?}");
     assert!(offered.iter().any(|e| e == "mov"));
 }
+
+/// A host's hidden entries (`?embed`) leave the menus, Quick Apply, the menu list and the
+/// keyboard; a submenu left empty goes too, and so do the header's Home and GitHub buttons.
+#[test]
+fn hidden_entries_leave_the_menus_shortcuts_and_header() {
+    let mut h = harness();
+    h.state_mut().hooks.hidden = effectcraft_engine::menus::Hidden::new(&[
+        "file.saveAs",
+        "file.saveCopy",
+        "file.saveCopyAsXml",
+        r#"app.settings {"page":"general"}"#,
+        "app.home",
+        "help.github",
+    ])
+    .unwrap();
+    h.run_steps(2);
+    assert!(h.state().auto.find("header.home").is_none());
+    assert!(h.state().auto.find("header.github").is_none());
+    let items = effectcraft_ui_egui::menus::menu_items(h.state());
+    assert!(items.iter().all(|e| e.id != "file.saveAs"));
+    assert!(items.iter().any(|e| e.id == "file.save"));
+    assert!(items.iter().any(|e| e.id == "app.settings" && e.params["page"] == "audio"));
+    assert!(!items.iter().any(|e| e.id == "app.settings" && e.params["page"] == "general"));
+    let (mods, k) = effectcraft_ui_egui::menus::parse_shortcut("Cmd+Alt+;").unwrap();
+    h.input_mut().events.push(Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: mods });
+    h.run_steps(2);
+    assert_eq!(h.state().dialog, None, "the hidden entry's shortcut does nothing");
+    let file = rect(&h, "menu.File");
+    click_at(&mut h, file.center());
+    assert!(shown(&h, "Save as Template"), "the File menu is open");
+    assert!(!shown(&h, "Save As"), "the emptied Save As submenu is gone");
+    key(&mut h, Key::Escape);
+    let mut h = harness();
+    h.input_mut().events.push(Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: mods });
+    h.run_steps(2);
+    assert_eq!(h.state().dialog, Some(effectcraft_ui_egui::Dialog::Settings), "without the host's rules it runs");
+}

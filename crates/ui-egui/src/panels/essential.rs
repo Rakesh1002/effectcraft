@@ -163,6 +163,9 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
         {
             actions.push(("essential.addMedia".into(), json!({"layer": l})));
         }
+        if app.hooks.hidden.command("essential.exportTemplate", &json!({})) {
+            return;
+        }
         let r = ui.add_enabled(!eg.controls.is_empty(), egui::Button::new(tr("Export Template…")));
         app.auto.add("essential.export", r.rect, "Export Template");
         if r.clicked() {

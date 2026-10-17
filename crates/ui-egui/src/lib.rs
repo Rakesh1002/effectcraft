@@ -169,6 +169,8 @@ pub struct Hooks {
     /// Tells the user the graphics device was lost and the window is closing, once. `saved` is
     /// the auto-save of unsaved changes (`None`: nothing was unsaved), its path or why it failed.
     pub device_lost: Option<Box<dyn Fn(Option<Result<String, String>>)>>,
+    /// Menu entries, shortcuts and header buttons the host leaves out.
+    pub hidden: effectcraft_engine::menus::Hidden,
 }
 
 impl Hooks {

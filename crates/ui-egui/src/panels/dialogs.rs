@@ -339,7 +339,7 @@ fn about_main(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, cmd: &mut
     ui.label(tr("comotion engine, based on EffectCraft (MIT/Apache-2.0)"));
     ui.add_space(14.0);
     let links: [(Icon, &str, &str, &'static str); 1] = [(Icon::Code, "Source code on GitHub", effectcraft_engine::links::GITHUB, "help.github")];
-    for (icon, label, url, c) in links {
+    for (icon, label, url, c) in links.into_iter().filter(|l| !app.hooks.hidden.command(l.3, &json!({}))) {
         let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
         let p = ui.painter();
         p.rect_filled(r, 6.0, if resp.hovered() { t.hover } else { t.field_bg });
@@ -574,7 +574,7 @@ fn palette(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             .map(|m| (m.path.join(" ▸ ") + " ▸ " + &m.label, m.id, if m.params.is_null() { json!({}) } else { m.params }, m.shortcut.unwrap_or_default()))
             .collect();
         for c in effectcraft_engine::command_specs().iter().filter(|c| c.menu.is_empty() && c.journal && c.params == "{}") {
-            if app.session.is_enabled(c.id) {
+            if app.session.is_enabled(c.id) && !app.hooks.hidden.command(c.id, &json!({})) {
                 v.push((c.label.to_string(), c.id.to_string(), json!({}), c.shortcut.unwrap_or("").to_string()));
             }
         }

@@ -618,10 +618,11 @@ fn labels_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, cur: &Value, acts: &mu
 }
 
 pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
-    let all = pages();
+    let mut all = pages();
+    all.retain(|p| !app.hooks.hidden.command("app.settings", &json!({"page": p.id})));
     let mut page = app.dialog_state.settings_page.clone();
     if !all.iter().any(|p| p.id == page) {
-        page = "general".into();
+        page = all.first().map_or("general", |p| p.id).into();
     }
     let idx = all.iter().position(|p| p.id == page).unwrap_or(0);
     let cur = serde_json::to_value(&app.session.prefs).unwrap_or_default();

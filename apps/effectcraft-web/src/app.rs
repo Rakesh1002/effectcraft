@@ -230,9 +230,13 @@ fn install_hooks(app: &mut EffectcraftApp) {
     app.hooks.audio_devices = Some(Box::new(|| vec!["Browser default output".into()]));
 }
 
-/// `?embed`: the pickers hand the browser files to the host page, and saving a project asks the
-/// host to save it.
+/// `?embed`: the pickers hand the browser files to the host page, saving a project asks the host
+/// to save it, and the menus leave out [`embed::HIDDEN`].
 fn install_embed_hooks(app: &mut EffectcraftApp) {
+    match effectcraft_engine::menus::Hidden::new(embed::HIDDEN) {
+        Ok(h) => app.hooks.hidden = h,
+        Err(e) => log::warn!("embed menus: {e}"),
+    }
     app.hooks.pick_files = Some(Box::new(|exts: &[&str]| {
         let accept = exts.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join(",");
         if let Err(e) = files::pick_raw(&accept, true, |picked| embed::import_request("import", picked)) {

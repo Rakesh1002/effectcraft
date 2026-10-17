@@ -35,13 +35,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     x += 32.0;
 
     // Home.
-    let home = Rect::from_min_size(pos2(x, cy - 13.0), vec2(26.0, 26.0));
-    let home_response = widgets::icon_button(ui, home, Icon::Home, app.ui.start_screen, &t, egui::Id::new("tool-home")).on_hover_text(tr("Home"));
-    app.auto.add_response("header.home", &home_response, "Home");
-    if home_response.clicked() {
-        app.ui.start_screen = !app.ui.start_screen;
+    if !app.hooks.hidden.command("app.home", &json!({})) {
+        let home = Rect::from_min_size(pos2(x, cy - 13.0), vec2(26.0, 26.0));
+        let home_response = widgets::icon_button(ui, home, Icon::Home, app.ui.start_screen, &t, egui::Id::new("tool-home")).on_hover_text(tr("Home"));
+        app.auto.add_response("header.home", &home_response, "Home");
+        if home_response.clicked() {
+            app.ui.start_screen = !app.ui.start_screen;
+        }
+        x += 30.0;
     }
-    x += 30.0;
     p.line_segment([pos2(x, cy - 10.0), pos2(x, cy + 10.0)], Stroke::new(1.0, t.separator));
     x += 6.0;
 
@@ -184,12 +186,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // Right side: project buttons, workspaces.
     let mut rx = rect.max.x - 10.0;
-    let r = Rect::from_min_max(pos2(rx - 26.0, cy - 13.0), pos2(rx, cy + 13.0));
-    if widgets::icon_button(ui, r, Icon::Code, false, &t, egui::Id::new("hdr-github")).on_hover_text(tr("EffectCraft on GitHub")).clicked() {
-        let _ = app.session.execute("help.github", json!({}));
+    if !app.hooks.hidden.command("help.github", &json!({})) {
+        let r = Rect::from_min_max(pos2(rx - 26.0, cy - 13.0), pos2(rx, cy + 13.0));
+        if widgets::icon_button(ui, r, Icon::Code, false, &t, egui::Id::new("hdr-github")).on_hover_text(tr("EffectCraft on GitHub")).clicked() {
+            let _ = app.session.execute("help.github", json!({}));
+        }
+        app.auto.add("header.github", r, "EffectCraft on GitHub");
+        rx = r.min.x - 4.0;
     }
-    app.auto.add("header.github", r, "EffectCraft on GitHub");
-    rx = r.min.x - 4.0;
     // Appearance: Sync with System, Light, Dark (a monitor, sun or moon), one click to the next.
     let (icon, mode) = match app.session.prefs.appearance.appearance_mode.as_str() {
         "auto" => (Icon::Monitor, tr("Sync with System")),
@@ -241,21 +245,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if mresp.clicked() {
         widgets::open_popup(ui, egui::Id::new("ws-pop"));
     }
-    let names: Vec<String> = crate::dock::WORKSPACES.iter().map(|s| s.to_string()).collect();
-    if let Some(i) = widgets::popup_menu(
-        ui,
-        egui::Id::new("ws-pop"),
-        more.left_bottom() - vec2(140.0, 0.0),
-        &names,
-        crate::dock::WORKSPACES.iter().position(|w| *w == app.ui.workspace),
-    ) {
-        app.set_workspace(crate::dock::WORKSPACES[i]);
+    let workspaces: Vec<&str> =
+        crate::dock::WORKSPACES.iter().copied().filter(|w| !app.hooks.hidden.command("window.workspace", &json!({"name": w}))).collect();
+    let names: Vec<String> = workspaces.iter().map(|s| s.to_string()).collect();
+    if let Some(i) =
+        widgets::popup_menu(ui, egui::Id::new("ws-pop"), more.left_bottom() - vec2(140.0, 0.0), &names, workspaces.iter().position(|w| *w == app.ui.workspace))
+        && let Some(w) = workspaces.get(i)
+    {
+        app.set_workspace(w);
     }
     rx = more.min.x - 6.0;
     // After Effects 2026's workspace bar order (right to left here): Default, Review, Learn,
     // Small Screen, Standard.
     let shown = ["Standard", "Small Screen", "Learn", "Review", "Default"];
-    for name in shown {
+    for name in shown.into_iter().filter(|n| workspaces.contains(n)) {
         let g = p.layout_no_wrap(name.to_string(), Tokens::ui(12.0), t.text);
         let w = g.size().x + 16.0;
         let r = Rect::from_min_max(pos2(rx - w, cy - 13.0), pos2(rx, cy + 13.0));
@@ -623,6 +626,9 @@ fn puppet_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter
 
 fn ws_menu(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
     for w in app.workspace_names() {
+        if app.hooks.hidden.command("window.workspace", &json!({"name": w})) {
+            continue;
+        }
         if ui.selectable_label(app.ui.workspace == w, &w).clicked() {
             app.set_workspace(&w);
             ui.close();

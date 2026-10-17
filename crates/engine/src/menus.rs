@@ -233,6 +233,62 @@ pub fn entries() -> Vec<(Vec<String>, &'static MenuEntry)> {
     out
 }
 
+/// Entries a host leaves out of its menus and shortcuts (a page embedded in another app has no
+/// desktop windows, files or scripts). A rule is `command`, `command {params}` (entries whose
+/// params include these) or `@dynamic:name`.
+#[derive(Clone, Debug, Default)]
+pub struct Hidden(Vec<(String, Value)>);
+
+impl Hidden {
+    pub fn new(rules: &[&str]) -> Result<Self, String> {
+        rules
+            .iter()
+            .map(|r| match r.split_once(' ') {
+                Some((c, p)) => serde_json::from_str(p).map(|p| (c.to_string(), p)).map_err(|e| format!("`{r}`: {e}")),
+                None => Ok((r.to_string(), Value::Null)),
+            })
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+
+    pub fn command(&self, command: &str, params: &Value) -> bool {
+        self.0.iter().any(|(c, p)| {
+            c == command
+                && match p {
+                    Value::Object(want) => want.iter().all(|(k, v)| params.get(k) == Some(v)),
+                    _ => true,
+                }
+        })
+    }
+
+    pub fn is_hidden(&self, n: &MenuNode) -> bool {
+        match n {
+            MenuNode::Item(e) => self.command(&e.command, &e.params),
+            MenuNode::Dynamic { name } => self.0.iter().any(|(c, _)| c.strip_prefix("@dynamic:") == Some(name.as_str())),
+            MenuNode::Submenu { children, .. } => children.iter().all(|c| matches!(c, MenuNode::Separator) || self.is_hidden(c)),
+            MenuNode::Separator => false,
+        }
+    }
+
+    /// `nodes` as the host shows them: no hidden entries, emptied submenus, or separators at
+    /// either end or next to each other.
+    pub fn shown<'a>(&self, nodes: &'a [MenuNode]) -> Vec<&'a MenuNode> {
+        let mut out: Vec<&MenuNode> = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            match n {
+                MenuNode::Separator if out.last().is_none_or(|l| matches!(l, MenuNode::Separator)) => {}
+                MenuNode::Separator => out.push(n),
+                _ if self.is_hidden(n) => {}
+                _ => out.push(n),
+            }
+        }
+        if out.last().is_some_and(|l| matches!(l, MenuNode::Separator)) {
+            out.pop();
+        }
+        out
+    }
+}
+
 /// Display label of an entry: label names come from Settings ▸ Labels.
 pub fn entry_label(s: &Session, e: &MenuEntry) -> String {
     let comp_name = || s.active_comp_id().and_then(|c| s.project.item(c)).map(|i| i.name.clone()).unwrap_or_else(|| "(none)".into());
