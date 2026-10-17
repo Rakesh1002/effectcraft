@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 /// Preset file in the config store.
 pub const SHORTCUTS_FILE: &str = "shortcuts.json";
 /// The built-in (read-only) preset.
-pub const DEFAULT_PRESET: &str = "EffectCraft Default";
+pub const DEFAULT_PRESET: &str = "comotion Default";
 /// Scope of application-wide shortcuts.
 pub const APP_SCOPE: &str = "Application";
 

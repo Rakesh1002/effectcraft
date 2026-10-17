@@ -689,7 +689,7 @@ pub const VIEWS: &[&str] = &["Standard", "Tone Mapped", "Raw"];
 
 /// Configuration popup: the built-in config, or a custom `.ocio` file (Config File: a path or
 /// the config's text; spaces chosen by name, see [`crate::ocio_config`]).
-pub const CONFIGS: &[&str] = &["Built-in (EffectCraft minimal)", "Custom (.ocio file)"];
+pub const CONFIGS: &[&str] = &["Built-in (comotion minimal)", "Custom (.ocio file)"];
 
 /// Built-in looks: CDLs applied in ACEScct.
 pub fn looks() -> Vec<(&'static str, Cdl)> {
@@ -1471,7 +1471,7 @@ pub fn specs() -> Vec<EffectSpec> {
             "OCIO Look Transform",
             cc,
             vec![
-                p("config", "Configuration", Value::Enum(0), popup(&["Built-in (EffectCraft minimal)"])),
+                p("config", "Configuration", Value::Enum(0), popup(&["Built-in (comotion minimal)"])),
                 space_param("source", "Source", acescg),
                 space_param("destination", "Destination", acescg),
                 p("look", "Look", Value::Enum(0), popup(&look_opts)),

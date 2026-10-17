@@ -541,8 +541,8 @@ fn effect_categories() -> Vec<MenuNode> {
 
 /// The After Effects menu layout. Labels use "..." like AE's macOS menus.
 pub const TREE: &str = r#"
-[mac] EffectCraft
-  About EffectCraft... | app.about
+[mac] comotion
+  About comotion... | app.about
   ---
   Settings...
     General... | app.settings {"page":"general"} | Cmd+Alt+;
@@ -563,11 +563,11 @@ pub const TREE: &str = r#"
     3D... | app.settings {"page":"3d"}
     Scripting & Expressions... | app.settings {"page":"scripting"}
   ---
-  Hide EffectCraft | app.hide
+  Hide comotion | app.hide
   Hide Others | app.hideOthers
   Show All | app.showAll
   ---
-  Quit EffectCraft | app.quit
+  Quit comotion | app.quit
 File
   New
     New Project | file.newProject
@@ -594,7 +594,7 @@ File
     File... | file.import
     Multiple Files... | file.importMultiple
     Adobe Premiere Pro Project... | file.importTimeline
-    EffectCraft Project... | file.importProject
+    comotion Project... | file.importProject
     Placeholder... | file.importPlaceholder
     Solid... | file.importSolid
     Lottie... | file.importLottie
@@ -1306,7 +1306,7 @@ Help
   EffectCraft on GitHub | help.github
   Open Demo Project | file.openDemoProject
   [!mac] ---
-  [!mac] About EffectCraft... | app.about
+  [!mac] About comotion... | app.about
 "#;
 
 #[cfg(test)]
