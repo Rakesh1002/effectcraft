@@ -60,8 +60,43 @@ impl H264 {
         Ok(H264 { enc, w, h, rate, y: vec![], u: vec![], v: vec![] })
     }
     fn packets(&self, ps: Vec<filmcraft_h264enc::Packet>) -> Vec<Packet> {
-        ps.into_iter().map(|p| Packet { data: p.data, key: p.keyframe, cto: (p.pts - p.dts) as i32 }).collect()
+        ps.into_iter().map(|p| Packet { data: rename_encoder(p.data), key: p.keyframe, cto: (p.pts - p.dts) as i32 }).collect()
     }
+}
+
+/// What the first access unit's user-data SEI names as the encoder.
+const ENCODER_NAME: &str = "comotion H.264 encoder";
+
+/// The encoder's user-data SEI (payload type 5, a 16-byte UUID, then the text) with
+/// [`ENCODER_NAME`] in place of FilmCraft's name; other NALs, and data that doesn't parse as
+/// length-prefixed NALs, pass through.
+fn rename_encoder(data: Vec<u8>) -> Vec<u8> {
+    const FROM: &[u8] = b"filmcraft-h264enc ";
+    if !data.windows(FROM.len()).any(|w| w == FROM) {
+        return data;
+    }
+    let mut out = Vec::with_capacity(data.len());
+    let mut rest = &data[..];
+    while let Some((len, tail)) = rest.split_first_chunk::<4>() {
+        let Some((nal, next)) = tail.split_at_checked(u32::from_be_bytes(*len) as usize) else { return data };
+        let renamed = match nal {
+            [h, 5, size, body @ ..] if h & 0x1f == 6 && *size < 255 => match body.split_first_chunk::<16>() {
+                Some((uuid, text)) if text.starts_with(FROM) => {
+                    let mut sei = vec![*h, 5, (16 + ENCODER_NAME.len()) as u8];
+                    sei.extend_from_slice(uuid);
+                    sei.extend_from_slice(ENCODER_NAME.as_bytes());
+                    sei.push(0x80);
+                    sei
+                }
+                _ => nal.to_vec(),
+            },
+            _ => nal.to_vec(),
+        };
+        out.extend_from_slice(&(renamed.len() as u32).to_be_bytes());
+        out.extend_from_slice(&renamed);
+        rest = next;
+    }
+    if rest.is_empty() { out } else { data }
 }
 
 impl VideoEncoder for H264 {
@@ -398,5 +433,27 @@ mod tests {
         assert_eq!(y10[1], 64);
         assert_eq!(cb[0], 512);
         assert!(cr[2] > 900, "red has high Cr: {}", cr[2]);
+    }
+
+    #[test]
+    fn h264_names_comotions_encoder() {
+        let (w, h) = (32u32, 32u32);
+        let mut e = H264::new(w, h, FrameRate::new(30, 1), 500).unwrap();
+        let rgba = vec![128u8; (w * h * 4) as usize];
+        let mut data = vec![];
+        for i in 0..2 {
+            data.extend(e.encode(&rgba, i).unwrap().into_iter().flat_map(|p| p.data));
+        }
+        data.extend(e.flush().unwrap().into_iter().flat_map(|p| p.data));
+        let has = |s: &[u8]| data.windows(s.len()).any(|w| w == s);
+        assert!(has(ENCODER_NAME.as_bytes()));
+        assert!(!has(b"filmcraft-h264enc"));
+        let mut rest = &data[..];
+        while let Some((len, tail)) = rest.split_first_chunk::<4>() {
+            let n = u32::from_be_bytes(*len) as usize;
+            assert!(n > 0 && n <= tail.len(), "length-prefixed NALs stay intact");
+            rest = &tail[n..];
+        }
+        assert!(rest.is_empty());
     }
 }
